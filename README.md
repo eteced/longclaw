@@ -260,4 +260,4 @@ DEEPSEEK_MODEL=deepseek-chat
 
 ## License
 
-MIT
+Modified MIT
