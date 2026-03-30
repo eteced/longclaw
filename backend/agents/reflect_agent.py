@@ -65,7 +65,7 @@ class ReflectAgent:
         self._agent_states: dict[str, AgentState] = {}
         self._running: bool = False
         self._check_interval: int = 30  # seconds
-        self._stuck_threshold: int = 120  # seconds without activity
+        self._stuck_threshold: int | None = 120  # seconds without activity, None means disabled
         self._same_output_threshold: int = 3  # consecutive same outputs
         self._prompt_templates: dict[str, str] = {
             "gentle": [
@@ -88,6 +88,7 @@ class ReflectAgent:
         logger.info(f"Reflect agent {self._id} started")
 
         # Load configuration
+        # Note: get_int returns None when config value is -1 (disabled)
         self._check_interval = await config_service.get_int("reflect_check_interval", 30)
         self._stuck_threshold = await config_service.get_int("reflect_stuck_threshold", 120)
 
@@ -185,7 +186,11 @@ class ReflectAgent:
         time_since_activity = (now - state.last_activity).total_seconds()
 
         # Check if agent is stuck based on time
-        is_time_stuck = time_since_activity > self._stuck_threshold
+        # If _stuck_threshold is None (disabled), skip time-based check
+        if self._stuck_threshold is None:
+            is_time_stuck = False
+        else:
+            is_time_stuck = time_since_activity > self._stuck_threshold
 
         # Check if agent is stuck based on repeated outputs
         is_output_stuck = state.consecutive_same_outputs >= self._same_output_threshold
@@ -193,13 +198,14 @@ class ReflectAgent:
         # Determine intervention level
         if is_time_stuck or is_output_stuck:
             # More severe: over 2x threshold
-            if time_since_activity > self._stuck_threshold * 2:
+            if self._stuck_threshold is not None and time_since_activity > self._stuck_threshold * 2:
                 return ReflectAnalysis(
                     agent_id=state.agent_id,
                     needs_intervention=True,
                     is_truly_stuck=True,
                     intervention_message=self._get_prompt("urgent"),
-                    should_terminate=time_since_activity > self._stuck_threshold * 3,
+                    should_terminate=self._stuck_threshold is not None
+                        and time_since_activity > self._stuck_threshold * 3,
                     reason=f"Agent inactive for {int(time_since_activity)}s",
                 )
 

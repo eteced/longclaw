@@ -185,8 +185,9 @@ class WorkerAgent(SubAgent):
             logger.warning(f"Failed to load WORKER prompt from database: {e}")
 
         # Resolve base timeout from config
+        # Note: get_float returns None when config value is -1 (unlimited)
         base_timeout = self._timeout or await config_service.get_float("worker_subtask_timeout", 300.0)
-        self._timeout_manager._base_timeout = int(base_timeout)
+        self._timeout_manager._base_timeout = int(base_timeout) if base_timeout is not None else None
 
         # Start the timeout manager
         self._timeout_manager.start()

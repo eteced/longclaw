@@ -334,6 +334,134 @@ if __name__ == "__main__":
     asyncio.run(test_integration())
 ```
 
+### 任务终止测试
+
+测试任务在执行过程中被手动终止的功能。
+
+```python
+#!/usr/bin/env python3
+"""任务终止功能测试脚本"""
+
+import asyncio
+import aiohttp
+import json
+
+API_URL = "http://localhost:8001"
+API_KEY = "your-api-key"
+
+async def test_task_termination():
+    """测试任务终止功能"""
+    async with aiohttp.ClientSession() as session:
+        headers = {"X-API-Key": API_KEY}
+
+        # 1. 获取 Web Channel
+        async with session.get(f"{API_URL}/api/chat/web-channel", headers=headers) as resp:
+            channel = await resp.json()
+            channel_id = channel["id"]
+            print(f"✓ 获取 Channel: {channel_id}")
+
+        # 2. 发送一个复杂任务（会触发 OwnerAgent）
+        async with session.post(
+            f"{API_URL}/api/chat/send",
+            headers={**headers, "Content-Type": "application/json"},
+            data=json.dumps({
+                "channel_id": channel_id,
+                "content": "帮我搜索并对比三款最新的智能手机，分析各自的优缺点"
+            })
+        ) as resp:
+            result = await resp.json()
+            task_id = result.get("task_id")
+            message_id = result.get("message_id")
+            print(f"✓ 创建任务: {task_id}")
+
+        if not task_id:
+            print("✗ 未创建任务，跳过终止测试")
+            return
+
+        # 3. 等待一小段时间让任务开始执行
+        await asyncio.sleep(2)
+
+        # 4. 检查任务状态（应该是 RUNNING）
+        async with session.get(f"{API_URL}/api/tasks/{task_id}", headers=headers) as resp:
+            task = await resp.json()
+            print(f"✓ 任务状态: {task['status']}")
+            owner_agent_id = task.get("owner_agent_id")
+            print(f"  Owner Agent: {owner_agent_id}")
+
+        # 5. 获取关联的 agents
+        async with session.get(
+            f"{API_URL}/api/agents?task_id={task_id}",
+            headers=headers
+        ) as resp:
+            agents = await resp.json()
+            print(f"✓ 关联 Agents: {len(agents.get('items', []))} 个")
+            for agent in agents.get("items", []):
+                print(f"  - {agent['agent_type']}: {agent['id']} ({agent['status']})")
+
+        # 6. 终止任务
+        print("\n>>> 发送终止请求...")
+        async with session.post(
+            f"{API_URL}/api/tasks/{task_id}/terminate",
+            headers=headers
+        ) as resp:
+            terminated_task = await resp.json()
+            print(f"✓ 任务已终止: {terminated_task['status']}")
+
+        # 7. 验证任务状态
+        async with session.get(f"{API_URL}/api/tasks/{task_id}", headers=headers) as resp:
+            task = await resp.json()
+            assert task["status"] == "terminated", f"预期 terminated，实际 {task['status']}"
+            assert task["terminated_at"] is not None, "terminated_at 应该有值"
+            print(f"✓ 任务状态验证通过: {task['status']}")
+
+        # 8. 验证 Owner Agent 状态
+        if owner_agent_id:
+            async with session.get(f"{API_URL}/api/agents/{owner_agent_id}", headers=headers) as resp:
+                if resp.status == 200:
+                    owner = await resp.json()
+                    assert owner["status"] == "terminated", f"Owner Agent 应为 terminated，实际 {owner['status']}"
+                    print(f"✓ Owner Agent 状态验证通过: {owner['status']}")
+
+        # 9. 验证所有 Worker Agents 状态
+        async with session.get(
+            f"{API_URL}/api/agents?task_id={task_id}",
+            headers=headers
+        ) as resp:
+            agents = await resp.json()
+            for agent in agents.get("items", []):
+                if agent["agent_type"] in ("WORKER", "OWNER"):
+                    assert agent["status"] == "terminated", \
+                        f"Agent {agent['id']} 应为 terminated，实际 {agent['status']}"
+            print(f"✓ 所有 Worker Agents 已终止")
+
+        # 10. 验证子任务状态
+        async with session.get(f"{API_URL}/api/tasks/{task_id}/subtasks", headers=headers) as resp:
+            subtasks = await resp.json()
+            for subtask in subtasks:
+                if subtask["status"] not in ("completed", "failed", "terminated"):
+                    print(f"  ! 子任务 {subtask['id']} 状态异常: {subtask['status']}")
+            print(f"✓ 子任务状态验证完成 ({len(subtasks)} 个)")
+
+        print("\n✅ 任务终止测试通过!")
+
+if __name__ == "__main__":
+    asyncio.run(test_task_termination())
+```
+
+### 终止功能验证清单
+
+手动验证终止功能时，检查以下项目：
+
+| 检查项 | 预期结果 |
+|--------|----------|
+| 任务状态 | 变为 `terminated` |
+| `terminated_at` 字段 | 有时间戳 |
+| Owner Agent 状态 | 变为 `terminated` |
+| Worker Agents 状态 | 全部变为 `terminated` |
+| 未完成的子任务 | 状态变为 `terminated` |
+| 已完成的子任务 | 状态保持不变 |
+| Agent 日志 | 显示检测到终止并退出 |
+
 ---
 
 ## 常见问题
@@ -460,4 +588,5 @@ ResidentAgent (常驻)
 
 ## 更新日志
 
+- 2026-03-30: 添加任务终止功能测试案例
 - 2026-03-25: 初始版本，添加集成测试指南

@@ -283,7 +283,7 @@ class SubtaskResult:
     error: str | None = None
 
 
-class OwnerAgent:
+class OwnerAgent(BaseAgent):
     """OwnerAgent - orchestrates task decomposition and execution.
 
     This agent:
@@ -310,78 +310,49 @@ class OwnerAgent:
             timeout: Total execution timeout in seconds. None uses config default.
             max_subagents: Maximum number of WorkerAgents to create.
         """
-        self._id: str | None = None  # Will be set after persist
-        self._task_id = task_id
-        self._parent_agent_id = parent_agent_id
+        # Initialize BaseAgent
+        super().__init__(
+            agent_id=None,  # Will be set after persist
+            name="OwnerAgent",
+            agent_type=AgentType.OWNER,
+            parent_agent_id=parent_agent_id,
+            task_id=task_id,
+            timeout=timeout or 600,
+        )
+
+        # OwnerAgent specific attributes
         self._timeout = timeout  # Will be resolved in execute()
         self._max_subagents = max_subagents
-        self._status: AgentStatus = AgentStatus.IDLE
-        self._workers: list[WorkerAgent] = []
+        self._workers: list[tuple[SubtaskSpec, WorkerAgent]] = []
         self._completed = asyncio.Event()
-        self._db_model: Any = None  # Database model
 
-        # Dynamic timeout manager - no max extension limit, extend as long as there's progress
+        # Override timeout manager with OwnerAgent-specific settings
         self._timeout_manager = TimeoutManager(
             base_timeout=600,  # 10 minutes base
             max_extension=0,  # No limit - extend as long as there's progress
             min_progress_interval=60,
         )
 
-    @property
-    def id(self) -> str:
-        """Get agent ID."""
-        return self._id or "not_persisted"
+    async def persist(self) -> str:
+        """Persist the agent to database with OwnerAgent-specific logic.
 
-    @property
-    def status(self) -> AgentStatus:
-        """Get agent status."""
-        return self._status
-
-    async def _persist(self) -> str:
-        """Persist the agent to database.
+        Override BaseAgent.persist() to also update task.owner_agent_id.
 
         Returns:
             Agent ID.
         """
-        from backend.services.agent_service import agent_service
+        # Call parent's persist logic
+        await super().persist()
 
-        async with db_manager.session() as session:
-            agent = await agent_service.create_agent(
-                session,
-                agent_type=AgentType.OWNER,
-                name=f"OwnerAgent-{uuid.uuid4().hex[:6]}",
-                parent_agent_id=self._parent_agent_id,
-                task_id=self._task_id,
-            )
-            self._id = agent.id
-            self._db_model = agent
-            logger.info(f"Persisted OwnerAgent {self._id} to database")
-
-            # Update task with owner_agent_id
-            if self._task_id:
+        # OwnerAgent-specific: Update task with owner_agent_id
+        if self._task_id:
+            async with db_manager.session() as session:
                 await task_service.update_task(
                     session, self._task_id, owner_agent_id=self._id
                 )
+                logger.info(f"Updated task {self._task_id} with owner_agent_id={self._id}")
 
         return self._id
-
-    async def _update_status(self, status: AgentStatus) -> None:
-        """Update agent status in database.
-
-        Args:
-            status: New status.
-        """
-        self._status = status
-        if self._id and self._db_model:
-            async with db_manager.session() as session:
-                from sqlalchemy import select
-                result = await session.execute(
-                    select(Agent).where(Agent.id == self._id)
-                )
-                agent = result.scalar_one_or_none()
-                if agent:
-                    agent.status = status
-                    await session.commit()
 
     async def execute(self, user_request: str) -> str:
         """Execute a task by decomposing and orchestrating WorkerAgents.
@@ -394,17 +365,22 @@ class OwnerAgent:
         """
         # Persist agent to database first
         if not self._id:
-            await self._persist()
+            await self.persist()
 
         logger.info(f"OwnerAgent {self._id} starting task: {user_request[:100]}...")
         await self._update_status(AgentStatus.RUNNING)
 
         # Resolve base timeout from config
+        # Note: get_float returns None when config value is -1 (unlimited)
         base_timeout = self._timeout or await config_service.get_float("owner_task_timeout", 600.0)
-        self._timeout_manager._base_timeout = int(base_timeout)
+        self._timeout_manager._base_timeout = int(base_timeout) if base_timeout is not None else None
         self._timeout_manager.start()
 
         try:
+            # Check if terminated before starting
+            if await self._check_terminated():
+                return "任务已被终止"
+
             # Step 1: Decompose task
             subtasks = await self._decompose_task(user_request)
             self._timeout_manager.record_progress("decompose", f"Decomposed into {len(subtasks)} subtasks")
@@ -414,10 +390,18 @@ class OwnerAgent:
                 await self._update_status(AgentStatus.ERROR)
                 return "抱歉，我无法分析这个任务。请换种方式描述一下？"
 
+            # Check termination before executing subtasks
+            if await self._check_terminated():
+                return "任务已被终止"
+
             # Step 2: Execute subtasks in parallel
             results = await self._execute_subtasks(subtasks)
             self._timeout_manager.record_progress("execute", f"Executed {len(results)} subtasks")
             logger.info(f"OwnerAgent {self._id} got {len(results)} results")
+
+            # Check termination before synthesis
+            if await self._check_terminated():
+                return "任务已被终止"
 
             # Step 3: Synthesize results
             final_response = await self._synthesize_results(user_request, results)
@@ -803,6 +787,20 @@ class OwnerAgent:
         remaining_specs = list(subtasks)  # [spec, ...]
 
         while remaining_specs:
+            # Check if agent was terminated
+            if await self._check_terminated():
+                logger.info(f"OwnerAgent {self._id} terminated, stopping execution")
+                # Return empty results for remaining specs
+                for spec in remaining_specs:
+                    results[spec.id] = SubtaskResult(
+                        subtask_id=spec.id,
+                        description=spec.description,
+                        result="",
+                        success=False,
+                        error="Task terminated by user",
+                    )
+                break
+
             # Find tasks whose dependencies are all satisfied
             ready = [
                 spec for spec in remaining_specs
@@ -894,7 +892,11 @@ class OwnerAgent:
         # Build attempt suffix for messages
         attempt_suffix = f" (第{attempt}次尝试)" if attempt > 1 else ""
 
+        # Persist worker first to get its ID for message recording
+        await worker._persist()
+
         # Record message: Owner -> Worker (task dispatch)
+        # Store full description for complete traceability
         if self._task_id:
             try:
                 async with db_manager.session() as session:
@@ -904,7 +906,7 @@ class OwnerAgent:
                         sender_id=self._id,
                         receiver_type=ReceiverType.WORKER,
                         receiver_id=worker.id,
-                        content=f"[{worker._name}] 执行子任务 #{spec.id}{attempt_suffix}: {spec.description[:150]}",
+                        content=f"[{worker._name}] 执行子任务 #{spec.id}{attempt_suffix}:\n\n{spec.description}",
                         message_type=MessageType.TASK,
                         task_id=self._task_id,
                         subtask_id=worker._subtask_id,
@@ -920,18 +922,19 @@ class OwnerAgent:
             is_success = worker.status != AgentStatus.ERROR
 
             # Record message: Worker -> Owner (task result)
+            # Store full result, frontend will handle truncation/expand
             if self._task_id:
                 try:
                     async with db_manager.session() as session:
                         status_text = "✅ 完成" if is_success else "❌ 失败"
-                        result_preview = result[:150] if result else '无结果'
+                        # Record full result for complete traceability
                         await message_service.create_message(
                             session,
                             sender_type=SenderType.WORKER,
                             sender_id=worker.id,
                             receiver_type=ReceiverType.OWNER,
                             receiver_id=self._id,
-                            content=f"[{worker._name}] 子任务 #{spec.id} {status_text}{attempt_suffix}: {result_preview}",
+                            content=f"[{worker._name}] 子任务 #{spec.id} {status_text}{attempt_suffix}\n\n{result}",
                             message_type=MessageType.REPORT if is_success else MessageType.ERROR,
                             task_id=self._task_id,
                             subtask_id=worker._subtask_id,
@@ -952,7 +955,7 @@ class OwnerAgent:
         except Exception as e:
             logger.exception(f"WorkerAgent {worker.id} failed: {e}")
 
-            # Record error message
+            # Record error message - store full error for debugging
             if self._task_id:
                 try:
                     async with db_manager.session() as session:
@@ -962,7 +965,7 @@ class OwnerAgent:
                             sender_id=worker.id,
                             receiver_type=ReceiverType.OWNER,
                             receiver_id=self._id,
-                            content=f"[{worker._name}] 子任务 #{spec.id} ❌ 异常{attempt_suffix}: {str(e)[:150]}",
+                            content=f"[{worker._name}] 子任务 #{spec.id} ❌ 异常{attempt_suffix}\n\n{str(e)}",
                             message_type=MessageType.ERROR,
                             task_id=self._task_id,
                             subtask_id=worker._subtask_id,
@@ -1030,9 +1033,11 @@ class OwnerAgent:
         try:
             # Use the same timeout as configured for owner agent
             timeout = self._timeout_manager.get_current_timeout()
+            # None means unlimited, otherwise cap at 5 minutes for synthesis
+            effective_timeout = min(timeout, 300) if timeout is not None else None
             response = await asyncio.wait_for(
                 llm_service.complete(messages),
-                timeout=min(timeout, 300)  # Cap at 5 minutes for synthesis
+                timeout=effective_timeout
             )
             return response.content
         except asyncio.TimeoutError:
@@ -1070,3 +1075,36 @@ class OwnerAgent:
         # Now terminate self
         await self._update_status(AgentStatus.TERMINATED)
         logger.info(f"OwnerAgent {self._id} terminated")
+
+    # ==================== BaseAgent Abstract Methods ====================
+
+    async def on_start(self) -> None:
+        """Called when the agent starts. OwnerAgent uses execute() instead."""
+        pass
+
+    async def on_stop(self) -> None:
+        """Called when the agent stops."""
+        pass
+
+    async def on_message(self, message: Message) -> None:
+        """Handle an incoming message. OwnerAgent doesn't use message queue."""
+        logger.warning(f"OwnerAgent {self._id} received unexpected message")
+
+    async def on_idle(self) -> None:
+        """Called when the agent is idle. OwnerAgent doesn't use idle state."""
+        pass
+
+    async def generate_summary(self) -> str:
+        """Generate a summary of the agent's work.
+
+        Returns:
+            Summary text.
+        """
+        if self._workers:
+            worker_summaries = []
+            for spec, worker in self._workers:
+                if worker.result:
+                    worker_summaries.append(f"- {spec.id}: {worker.result[:100]}")
+            if worker_summaries:
+                return f"OwnerAgent 完成了 {len(self._workers)} 个子任务:\n" + "\n".join(worker_summaries)
+        return f"OwnerAgent {self._id}: 任务执行完成"

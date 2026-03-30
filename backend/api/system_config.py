@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import db_manager
@@ -41,10 +41,21 @@ class SystemConfigBatchUpdate(BaseModel):
 
 
 class ConfigImportData(BaseModel):
-    """Schema for importing configurations."""
+    """Schema for importing configurations.
 
-    version: str = "1.0"
-    configs: dict[str, Any]
+    Supports both legacy format (v1.0 with 'configs' key) and new format (v2.0
+    with 'system_configs', 'agent_settings', 'model_settings', 'profiles').
+    """
+
+    version: str = "2.0"
+    # Legacy format (v1.0): configs = {key: value}
+    configs: dict[str, Any] | None = None
+    # New format (v2.0): system_configs = {key: {value, description}}
+    system_configs: dict[str, Any] | None = None
+    agent_settings: dict[str, Any] | None = None
+    # Note: using 'model_settings' instead of 'model_config' to avoid Pydantic conflict
+    model_settings: dict[str, Any] | None = Field(None, alias="model_config")
+    profiles: list[dict[str, Any]] | None = None
 
 
 class ConfigProfileCreate(BaseModel):
@@ -164,7 +175,7 @@ async def import_config(
     """Import configurations from JSON data.
 
     Supports both legacy format (v1.0 with 'configs' key) and new format (v2.0
-    with 'system_configs', 'agent_settings', 'model_config', 'profiles').
+    with 'system_configs', 'agent_settings', 'model_settings', 'profiles').
 
     Args:
         data: Configuration import data.
@@ -174,7 +185,7 @@ async def import_config(
         Import result summary.
     """
     try:
-        result = await config_service.import_config(data.model_dump(), merge=merge)
+        result = await config_service.import_config(data.model_dump(by_alias=True), merge=merge)
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

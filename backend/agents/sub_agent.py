@@ -185,8 +185,9 @@ class SubAgent(BaseAgent):
             logger.warning(f"Failed to load SUB prompt from database: {e}")
 
         # Resolve base timeout from config
+        # Note: get_float returns None when config value is -1 (unlimited)
         base_timeout = self._timeout or await config_service.get_float("worker_subtask_timeout", 300.0)
-        self._timeout_manager._base_timeout = int(base_timeout)
+        self._timeout_manager._base_timeout = int(base_timeout) if base_timeout is not None else None
 
         # Start the timeout manager
         self._timeout_manager.start()
@@ -237,6 +238,7 @@ class SubAgent(BaseAgent):
         from backend.services.llm_service import llm_service
 
         # Get max tool rounds from config
+        # Note: get_int returns None when config value is -1 (unlimited)
         max_tool_rounds = await config_service.get_int("tool_max_rounds", 10)
 
         # Track consecutive web_search calls to prevent infinite search loops
@@ -244,11 +246,17 @@ class SubAgent(BaseAgent):
         MAX_CONSECUTIVE_SEARCHES = 3
 
         tool_round = 0
-        while tool_round < max_tool_rounds:
+        # If max_tool_rounds is None (unlimited), loop until break
+        while max_tool_rounds is None or tool_round < max_tool_rounds:
             # Check for timeout before each round
             if self._timeout_manager.is_timed_out():
                 current_timeout = self._timeout_manager.get_current_timeout()
                 raise asyncio.TimeoutError(f"Agent timed out after {current_timeout}s")
+
+            # Check if agent was terminated externally
+            if await self._check_terminated():
+                logger.info(f"SubAgent {self._id} terminated, stopping execution")
+                return "任务已被终止"
 
             tool_round += 1
             logger.debug(f"SubAgent {self._id} tool round {tool_round}")
@@ -329,6 +337,7 @@ class SubAgent(BaseAgent):
                     ))
 
                     # Then process each tool call and add tool result messages
+                    round_tool_results = []
                     for tool_call in response.tool_calls or []:
                         logger.info(f"SubAgent {self._id} calling tool: {tool_call.name}")
 
@@ -364,8 +373,32 @@ class SubAgent(BaseAgent):
                         ))
 
                         logger.info(f"SubAgent {self._id} tool {tool_call.name} executed: success={tool_result.success}")
+
+                        # Record tool result for message recording
+                        round_tool_results.append({
+                            "id": tool_call.id,
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                            "result": result_content,
+                            "success": tool_result.success,
+                        })
+
+                    # Record round to message system after all tools executed
+                    await self._record_round_to_message(
+                        round_num=tool_round,
+                        llm_response=response,
+                        tool_results=round_tool_results,
+                        is_final=False,
+                    )
                 else:
                     # LLM gave final response
+                    # Record final round to message system
+                    await self._record_round_to_message(
+                        round_num=tool_round,
+                        llm_response=response,
+                        tool_results=[],
+                        is_final=True,
+                    )
                     return response.content or "任务完成，但无结果返回。"
 
             except Exception as e:
@@ -417,3 +450,90 @@ class SubAgent(BaseAgent):
         if self._result:
             return f"任务: {self._description}\n结果: {self._result[:200]}"
         return f"任务: {self._description}\n状态: 未完成"
+
+    async def _record_round_to_message(
+        self,
+        round_num: int,
+        llm_response: "LLMResponse",
+        tool_results: list[dict[str, Any]],
+        is_final: bool,
+    ) -> None:
+        """Record execution round to message system.
+
+        Parses LLM response to separate thinking (<think> tags) from actual response.
+        """
+        from backend.services.message_service import message_service
+        from backend.models.message import SenderType, ReceiverType, MessageType
+        from backend.services.llm_service import LLMResponse
+        import re
+
+        # Parse thinking content from <think>...</think> tags
+        raw_content = llm_response.content or ""
+        thinking_content = ""
+        actual_content = raw_content
+
+        # Extract <think>...</think> content
+        think_match = re.search(r'<think\s*(.*?)\s*</think\s*>', raw_content, re.DOTALL)
+        if think_match:
+            thinking_content = think_match.group(1).strip()
+            # Remove think tags to get actual content
+            actual_content = re.sub(r'<think\s*.*?\s*</think\s*>', '', raw_content, flags=re.DOTALL).strip()
+
+        # Build human-readable markdown content
+        content_parts = [f"## Round {round_num}"]
+
+        # Add thinking section if present
+        if thinking_content:
+            content_parts.append("\n### 思考过程\n")
+            content_parts.append(thinking_content)
+
+        # Add actual response/content section
+        if actual_content:
+            if tool_results:
+                # Has tool calls, this is decision/action content
+                content_parts.append("\n### 决策\n")
+            else:
+                # No tool calls, this is the actual response
+                content_parts.append("\n### 回复\n")
+            content_parts.append(actual_content)
+
+        # Add tool calls section
+        if tool_results:
+            content_parts.append("\n### 工具调用\n")
+            for tr in tool_results:
+                args_str = ", ".join(f"{k}={v!r}" for k, v in tr.get("arguments", {}).items())
+                result_preview = tr['result'][:500] if len(tr.get('result', '')) > 500 else tr.get('result', 'N/A')
+                content_parts.append(f"**{tr['name']}**({args_str})\n```\n{result_preview}\n```\n")
+
+        # For final response, add summary section
+        if is_final and actual_content:
+            content_parts.append(f"\n### 总结\n{actual_content}")
+
+        content = "\n".join(content_parts)
+
+        # Build metadata (machine-readable)
+        metadata = {
+            "type": "agent_execution_round",
+            "agent_id": self._id,
+            "round_number": round_num,
+            "is_final": is_final,
+            "tool_calls": tool_results,
+        }
+
+        # Store to database
+        try:
+            async with db_manager.session() as session:
+                await message_service.create_message(
+                    session=session,
+                    sender_type=SenderType.WORKER,
+                    sender_id=self._id,
+                    receiver_type=ReceiverType.AGENT,
+                    receiver_id=self._id,
+                    content=content,
+                    message_type=MessageType.SYSTEM,
+                    task_id=self._task_id,
+                    subtask_id=getattr(self, '_subtask_id', None),
+                    metadata=metadata,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to record round message: {e}")

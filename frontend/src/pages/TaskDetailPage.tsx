@@ -22,6 +22,61 @@ function parseUTCDate(dateStr: string): Date {
 
 type TabType = 'subtasks' | 'messages' | 'agents';
 
+/**
+ * Format message label for display.
+ * Make Worker->Agent messages more readable.
+ * Shows specific agent names when available.
+ */
+function formatMessageLabel(message: Message, agents: Agent[]): string {
+  const { sender_type, receiver_type, sender_id, receiver_id } = message;
+
+  // Helper to find agent name by ID
+  const getAgentName = (agentId: string | null): string | null => {
+    if (!agentId) return null;
+    const agent = agents.find(a => a.id === agentId);
+    return agent?.name || null;
+  };
+
+  // Worker internal execution log (thinking + tool calls)
+  if (sender_type === 'worker' && receiver_type === 'agent') {
+    const workerName = getAgentName(sender_id) || 'Worker';
+    return `📝 ${workerName} 执行日志`;
+  }
+
+  // Worker -> Owner (task result)
+  if (sender_type === 'worker' && receiver_type === 'owner') {
+    const workerName = getAgentName(sender_id) || 'Worker';
+    return `📤 ${workerName} → Owner (任务结果)`;
+  }
+
+  // Owner -> Worker (task dispatch)
+  if (sender_type === 'owner' && receiver_type === 'worker') {
+    const workerName = getAgentName(receiver_id) || 'Worker';
+    return `📥 Owner → ${workerName} (任务分发)`;
+  }
+
+  // Channel -> Resident (user message)
+  if (sender_type === 'channel' && receiver_type === 'resident') {
+    return '💬 用户消息';
+  }
+
+  // Resident -> Channel (agent reply)
+  if (sender_type === 'resident' && receiver_type === 'channel') {
+    const residentName = getAgentName(sender_id) || 'Agent';
+    return `🤖 ${residentName} 回复`;
+  }
+
+  // System messages
+  if (sender_type === 'system') {
+    return '⚙️ 系统消息';
+  }
+
+  // Default: show capitalized types
+  const sender = sender_type.charAt(0).toUpperCase() + sender_type.slice(1);
+  const receiver = receiver_type.charAt(0).toUpperCase() + receiver_type.slice(1);
+  return `${sender} → ${receiver}`;
+}
+
 export const TaskDetailPage: React.FC = () => {
   const { id } = useParams<{ id: string }>();
   const [task, setTask] = useState<TaskDetail | null>(null);
@@ -30,6 +85,19 @@ export const TaskDetailPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabType>('subtasks');
+  const [expandedMessages, setExpandedMessages] = useState<Set<string>>(new Set());
+
+  const toggleMessageExpand = (messageId: string) => {
+    setExpandedMessages(prev => {
+      const next = new Set(prev);
+      if (next.has(messageId)) {
+        next.delete(messageId);
+      } else {
+        next.add(messageId);
+      }
+      return next;
+    });
+  };
 
   useEffect(() => {
     const fetchTask = async () => {
@@ -269,20 +337,26 @@ export const TaskDetailPage: React.FC = () => {
                       </div>
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium text-gray-900 capitalize">
-                            {message.sender_type}
-                          </span>
-                          <span className="text-gray-400">&rarr;</span>
-                          <span className="text-sm font-medium text-gray-900 capitalize">
-                            {message.receiver_type}
+                          <span className="text-sm font-medium text-gray-900">
+                            {formatMessageLabel(message, agents)}
                           </span>
                           <span className="text-xs text-gray-500">
                             {format(parseUTCDate(message.created_at), 'PPpp')}
                           </span>
                         </div>
-                        <p className="mt-1 text-sm text-gray-700 whitespace-pre-wrap">
+                        <p
+                          className={`mt-1 text-sm text-gray-700 whitespace-pre-wrap cursor-pointer ${
+                            !expandedMessages.has(message.id) ? 'line-clamp-3' : ''
+                          }`}
+                          onClick={() => toggleMessageExpand(message.id)}
+                        >
                           {message.content}
                         </p>
+                        {message.content && message.content.length > 100 && (
+                          <span className="text-xs text-blue-500">
+                            {expandedMessages.has(message.id) ? '点击收起' : '点击展开'}
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>

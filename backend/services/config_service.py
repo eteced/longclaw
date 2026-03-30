@@ -539,7 +539,7 @@ class ConfigService:
         async with self._cache_lock:
             return self._cache.get(key, default)
 
-    async def get_int(self, key: str, default: int = 0) -> int:
+    async def get_int(self, key: str, default: int = 0) -> int | None:
         """Get a configuration value as integer.
 
         Args:
@@ -547,15 +547,18 @@ class ConfigService:
             default: Default value if key not found.
 
         Returns:
-            Configuration value as integer.
+            Configuration value as integer, or None if value is -1 (unlimited).
+            Note: -1 is the special "unlimited" value for limit configs.
         """
         value = await self.get(key, default)
         try:
-            return int(value)
+            val = int(value)
+            # -1 means unlimited, return None so callers can handle it
+            return None if val == self.UNLIMITED_VALUE else val
         except (ValueError, TypeError):
             return default
 
-    async def get_float(self, key: str, default: float = 0.0) -> float:
+    async def get_float(self, key: str, default: float = 0.0) -> float | None:
         """Get a configuration value as float.
 
         Args:
@@ -563,11 +566,16 @@ class ConfigService:
             default: Default value if key not found.
 
         Returns:
-            Configuration value as float.
+            Configuration value as float, or None if value is -1 (unlimited).
+            Note: -1 is the special "unlimited" value for timeout/limit configs.
+            asyncio.wait_for() and httpx.Timeout() treat negative values as expired,
+            so returning None allows callers to use no timeout.
         """
         value = await self.get(key, default)
         try:
-            return float(value)
+            val = float(value)
+            # -1 means unlimited, return None so callers can skip timeout
+            return None if val == self.UNLIMITED_VALUE else val
         except (ValueError, TypeError):
             return default
 

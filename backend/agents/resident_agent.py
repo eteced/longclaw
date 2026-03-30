@@ -4,6 +4,7 @@ A persistent agent that handles user conversations through channels.
 """
 import asyncio
 import logging
+import re
 from datetime import datetime
 from typing import Any
 
@@ -97,6 +98,27 @@ class ResidentAgent(BaseAgent):
         self._pending_replies: dict[str, asyncio.Future[str]] = {}
         self._task_messages: list[ChatMessage] = []  # Messages for current task
         self._last_heartbeat: float = 0.0  # Timestamp of last heartbeat
+
+    def _parse_llm_response(self, raw_content: str) -> tuple[str, str]:
+        """Parse LLM response to separate thinking from actual content.
+
+        Args:
+            raw_content: Raw LLM response content.
+
+        Returns:
+            Tuple of (thinking_content, actual_content).
+        """
+        thinking_content = ""
+        actual_content = raw_content
+
+        # Extract <think>...</think> content
+        think_match = re.search(r'<think\s*(.*?)\s*</think\s*>', raw_content, re.DOTALL)
+        if think_match:
+            thinking_content = think_match.group(1).strip()
+            # Remove think tags to get actual content
+            actual_content = re.sub(r'<think\s*.*?\s*</think\s*>', '', raw_content, flags=re.DOTALL).strip()
+
+        return thinking_content, actual_content
 
     async def on_start(self) -> None:
         """Called when the agent starts."""
@@ -733,10 +755,12 @@ class ResidentAgent(BaseAgent):
             logger.info(f"  - Tool: {tool['function']['name']}")
 
         # Get max tool rounds from config
+        # Note: get_int returns None when config value is -1 (unlimited)
         max_tool_rounds = await config_service.get_int("tool_max_rounds", 10)
 
         tool_round = 0
-        while tool_round < max_tool_rounds:
+        # If max_tool_rounds is None (unlimited), loop until break
+        while max_tool_rounds is None or tool_round < max_tool_rounds:
             tool_round += 1
             logger.info(f"Tool round {tool_round} starting")
 
@@ -783,7 +807,9 @@ class ResidentAgent(BaseAgent):
                         await self._touch()
                 else:
                     # LLM gave a final response
-                    return response.content or "抱歉，我没法回答这个问题。"
+                    # Parse out thinking content and return actual response
+                    thinking, actual = self._parse_llm_response(response.content or "")
+                    return actual or "抱歉，我没法回答这个问题。"
 
             except Exception as e:
                 logger.exception(f"Error in task execution round {tool_round}: {e}")
@@ -857,7 +883,7 @@ class ResidentAgent(BaseAgent):
         return response
 
     async def _generate_chat_response(self) -> str:
-        """Generate a chat response using LLM.
+        """Generate a chat response using LLM with tool support.
 
         Returns:
             Generated response.
@@ -866,8 +892,40 @@ class ResidentAgent(BaseAgent):
             # Build messages for LLM
             messages = list(self._conversation_history)
 
-            response = await self.think(messages)
-            return response
+            # Get tool definitions for chat mode too (allows web_search during chat)
+            tools = tool_service.get_tool_definitions()
+            logger.info(f"Chat mode: {len(tools)} tools available")
+
+            # Use think_with_tools to allow tool calls during chat
+            response = await self.think_with_tools(messages, tools=tools)
+
+            # Check if LLM wants to call tools
+            if response.has_tool_calls:
+                # Process tool calls
+                for tool_call in response.tool_calls or []:
+                    logger.info(f"Chat mode: Executing tool: {tool_call.name}")
+                    tool_result = await tool_service.execute_tool(
+                        tool_call.name,
+                        **tool_call.arguments
+                    )
+                    # Add tool result to conversation
+                    result_content = tool_result.content
+                    if not tool_result.success and tool_result.error:
+                        result_content = f"错误: {tool_result.error}"
+
+                    messages.append(ChatMessage(
+                        role="tool",
+                        content=result_content,
+                        tool_call_id=tool_call.id,
+                        name=tool_call.name,
+                    ))
+
+                # Get final response after tool execution
+                response = await self.think_with_tools(messages, tools=tools)
+
+            # Parse out thinking content and return actual response
+            thinking, actual = self._parse_llm_response(response.content or "")
+            return actual or "嗯...让我想想该说什么..."
         except Exception as e:
             logger.exception(f"Error generating response: {e}")
             return "嗯...让我想想该说什么...出了点小问题，你能再说一遍吗？"

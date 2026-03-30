@@ -102,8 +102,8 @@ export interface ChannelListResponse {
 }
 
 // Message types
-export type SenderType = 'channel' | 'resident' | 'owner' | 'worker' | 'system';
-export type ReceiverType = 'channel' | 'resident' | 'owner' | 'worker' | 'user';
+export type SenderType = 'channel' | 'resident' | 'owner' | 'worker' | 'system' | 'agent';
+export type ReceiverType = 'channel' | 'resident' | 'owner' | 'worker' | 'user' | 'agent';
 export type MessageType = 'text' | 'task' | 'report' | 'error' | 'system';
 
 export interface Message {

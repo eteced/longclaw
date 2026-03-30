@@ -61,14 +61,14 @@ class TimeoutManager:
 
     def __init__(
         self,
-        base_timeout: int = 300,
+        base_timeout: int | None = 300,
         max_extension: int = 0,  # 0 means no limit - extend as long as there's progress
         min_progress_interval: int = 30,
     ) -> None:
         """Initialize the timeout manager.
 
         Args:
-            base_timeout: Base timeout in seconds.
+            base_timeout: Base timeout in seconds. None means unlimited (no timeout).
             max_extension: Maximum timeout extension in seconds. 0 means no limit.
             min_progress_interval: Minimum seconds between progress updates.
         """
@@ -151,22 +151,28 @@ class TimeoutManager:
         # Note: This should be awaited, but we can't await here
         # The caller should handle calling _touch() after record_progress
 
-    def get_current_timeout(self) -> int:
+    def get_current_timeout(self) -> int | None:
         """Get the current effective timeout.
 
         Returns:
-            Current timeout in seconds.
+            Current timeout in seconds, or None if unlimited.
         """
+        if self._base_timeout is None:
+            return None
         return self._base_timeout + self._current_extension
 
     def get_remaining_time(self) -> float:
         """Get remaining time before timeout.
 
         Returns:
-            Remaining seconds, or -1 if not started.
+            Remaining seconds, -1 if not started, or float('inf') if unlimited.
         """
         if not self._start_time:
             return -1
+
+        # If base_timeout is None, timeout is unlimited
+        if self._base_timeout is None:
+            return float('inf')
 
         elapsed = (datetime.utcnow() - self._start_time).total_seconds()
         remaining = self.get_current_timeout() - elapsed
@@ -176,9 +182,13 @@ class TimeoutManager:
         """Check if the agent has timed out.
 
         Returns:
-            True if timed out.
+            True if timed out. Always False if timeout is unlimited.
         """
         if not self._start_time:
+            return False
+
+        # If base_timeout is None, timeout is unlimited - never times out
+        if self._base_timeout is None:
             return False
 
         remaining = self.get_remaining_time()
@@ -384,7 +394,7 @@ class BaseAgent(ABC):
                 personality=self._personality,
                 parent_agent_id=self._parent_agent_id,
                 task_id=self._task_id,
-                llm_config=self._llm_config,
+                model_assignment=self._llm_config if self._llm_config else None,
                 system_prompt=self._system_prompt,
             )
             self._id = agent.id
@@ -477,6 +487,30 @@ class BaseAgent(ABC):
 
         # Publish update
         await message_service.publish_agent_update(self.id, status.value, self._task_id)
+
+    async def _check_terminated(self) -> bool:
+        """Check if this agent has been terminated in the database.
+
+        This should be called periodically during long-running operations
+        to detect external termination requests.
+
+        Returns:
+            True if the agent has been terminated, False otherwise.
+        """
+        if not self._id:
+            return False
+
+        try:
+            async with db_manager.session() as session:
+                agent = await agent_service.get_agent(session, self._id)
+                if agent and agent.status == AgentStatus.TERMINATED:
+                    self._status = AgentStatus.TERMINATED
+                    logger.info(f"Agent {self._id} detected external termination")
+                    return True
+        except Exception as e:
+            logger.warning(f"Failed to check termination status: {e}")
+
+        return False
 
     async def _touch(self) -> None:
         """Update agent's updated_at timestamp to signal it's still active.

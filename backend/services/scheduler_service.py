@@ -130,8 +130,13 @@ class SchedulerService:
         (via _heartbeat_during_execution) to prevent being marked as stale.
         """
         # Get agent timeout from config
+        # Note: get_int returns None when config value is -1 (disabled)
         if self._agent_timeout_seconds is None:
             self._agent_timeout_seconds = await config_service.get_int("scheduler_agent_timeout", 300)
+
+        # If timeout is None (disabled), skip health check
+        if self._agent_timeout_seconds is None:
+            return
 
         async with db_manager.session() as session:
             from sqlalchemy import select, and_

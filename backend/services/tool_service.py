@@ -283,7 +283,7 @@ class ToolService:
         self,
         session_name: str,
         url: str,
-        timeout: float,
+        timeout: float | None,
     ) -> tuple[bool, str]:
         """Run agent-browser CLI to open a page and get snapshot.
 
@@ -292,7 +292,7 @@ class ToolService:
         Args:
             session_name: Browser session name for isolation.
             url: URL to open.
-            timeout: Timeout in seconds.
+            timeout: Timeout in seconds, None means unlimited.
 
         Returns:
             Tuple of (success, output or error message).
@@ -323,7 +323,8 @@ class ToolService:
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
-                return False, f"Timeout after {timeout}s"
+                timeout_str = "unlimited" if timeout is None else f"{timeout}s"
+                return False, f"Timeout after {timeout_str}"
 
             if proc.returncode != 0:
                 error_msg = stderr.decode() if stderr else "Unknown error"
@@ -732,11 +733,13 @@ class ToolService:
             )
 
         # Get timeout from config if not specified
+        # Note: get_int returns None when config value is -1 (unlimited)
         if timeout is None:
             timeout = await config_service.get_int("command_timeout", 60)
 
-        # Cap timeout at 300 seconds
-        timeout = min(timeout, 300)
+        # Cap timeout at 300 seconds (unless unlimited)
+        if timeout is not None:
+            timeout = min(timeout, 300)
 
         logger.info(f"Executing command: {command} (timeout={timeout}s)")
 

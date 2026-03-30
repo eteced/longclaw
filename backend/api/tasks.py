@@ -288,7 +288,7 @@ async def terminate_task(
     task_id: str,
     session: AsyncSession = Depends(get_session),
 ) -> Task:
-    """Terminate a task.
+    """Terminate a task and all associated agents.
 
     Args:
         task_id: Task ID.
@@ -300,11 +300,47 @@ async def terminate_task(
     Raises:
         HTTPException: If task not found.
     """
-    task = await task_service.terminate_task(session, task_id)
+    from backend.services.agent_service import agent_service
+    from backend.models.agent import AgentStatus, Agent
+
+    # Get the task first
+    task = await task_service.get_task(session, task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    return task
+    # Update task status
+    task = await task_service.terminate_task(session, task_id)
+
+    # Terminate the owner agent if exists
+    if task and task.owner_agent_id:
+        await agent_service.terminate_agent(session, task.owner_agent_id)
+
+    # Terminate all workers assigned to this task
+    from sqlalchemy import select
+    result = await session.execute(
+        select(Agent).where(
+            Agent.task_id == task_id,
+            Agent.status != AgentStatus.TERMINATED,
+        )
+    )
+    workers = list(result.scalars().all())
+    for worker in workers:
+        await agent_service.terminate_agent(session, worker.id)
+
+    # Terminate all subtasks
+    subtasks = await task_service.get_subtasks(session, task_id)
+    for subtask in subtasks:
+        if subtask.status not in ("completed", "failed", "terminated"):
+            await task_service.update_subtask_status(
+                session,
+                subtask.id,
+                "terminated",
+                error="Task terminated by user",
+            )
+
+    # Refresh task to get latest state
+    await session.refresh(task)
+    return task  # type: ignore
 
 
 @router.get("/{task_id}/subtasks", response_model=list[SubtaskResponse])

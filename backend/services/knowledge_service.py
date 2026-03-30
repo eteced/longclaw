@@ -352,7 +352,7 @@ class KnowledgeService:
         session: AsyncSession,
         agent_id: str,
         query: str | None = None,
-        max_memories: int = 5,
+        max_memories: int | None = 5,
     ) -> str:
         """Get context including relevant memories.
 
@@ -360,7 +360,7 @@ class KnowledgeService:
             session: Database session.
             agent_id: Agent ID.
             query: Optional query to search for relevant memories.
-            max_memories: Maximum number of memories to include.
+            max_memories: Maximum number of memories to include. None means unlimited.
 
         Returns:
             Context string with relevant memories.

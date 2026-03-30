@@ -32,12 +32,13 @@ class MemoryService:
 
     def __init__(self) -> None:
         """Initialize the memory service."""
-        self._token_limit: int = 4000  # Default token limit
+        self._token_limit: int | None = 4000  # Default token limit, None means unlimited
         self._keep_recent: int = 5  # Keep last N messages intact
         self._compact_threshold: float = 0.8  # Compact when 80% of limit
 
     async def init(self) -> None:
         """Initialize the memory service."""
+        # Note: get_int returns None when config value is -1 (unlimited)
         self._token_limit = await config_service.get_int("memory_token_limit", 4000)
         self._keep_recent = await config_service.get_int("memory_keep_recent", 5)
         self._compact_threshold = await config_service.get_float("memory_compact_threshold", 0.8)
@@ -172,8 +173,12 @@ class MemoryService:
             messages: Current messages.
 
         Returns:
-            True if compaction is needed.
+            True if compaction is needed. False if token_limit is None (unlimited).
         """
+        # If token_limit is None (unlimited), never need compaction
+        if self._token_limit is None:
+            return False
+
         tokens = await self.estimate_tokens(messages)
         return tokens >= self._token_limit * self._compact_threshold
 
