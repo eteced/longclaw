@@ -81,6 +81,9 @@ async def send_message(request: SendMessageRequest) -> SendMessageResponse:
     Raises:
         HTTPException: If channel not found or agent not available.
     """
+    # Handle /new command - reset conversation context
+    is_new_command = request.content.strip() == "/new"
+
     async with db_manager.session() as session:
         # Get the channel
         channel = await channel_service.get_channel(session, request.channel_id)
@@ -98,6 +101,53 @@ async def send_message(request: SendMessageRequest) -> SendMessageResponse:
         if not agent:
             raise HTTPException(status_code=400, detail="Resident agent not running")
 
+        # Handle /new command - reset context and return early
+        if is_new_command:
+            await channel_service.reset_channel_context(session, channel.id)
+            logger.info(f"Channel {request.channel_id} context reset via /new command")
+            return SendMessageResponse(
+                message_id="",
+                reply="好的，已开启新对话。之前的上下文已清除，有什么可以帮你的？",
+                created_at=datetime.now().isoformat(),
+            )
+
+        # Load recent messages from channel as context
+        context_messages = []
+        if not is_new_command:
+            try:
+                max_context_messages = await config_service.get_int("memory_keep_recent", 20)
+                if max_context_messages <= 0:
+                    max_context_messages = 20
+
+                # Get context reset time to filter out messages before /new
+                context_reset_time = await channel_service.get_context_reset_time(
+                    session, request.channel_id
+                )
+
+                context_messages = await message_service.get_recent_channel_messages(
+                    session,
+                    channel_id=request.channel_id,
+                    limit=max_context_messages,
+                    exclude_types=[MessageType.TASK, MessageType.ERROR],
+                    after_time=context_reset_time,
+                )
+                logger.info(f"Loaded {len(context_messages)} messages as context for channel {request.channel_id}")
+            except Exception as e:
+                logger.warning(f"Failed to load context messages: {e}")
+
+        # Prepare message metadata with context
+        message_metadata = {}
+        if context_messages:
+            message_metadata["context_messages"] = [
+                {
+                    "role": "user" if msg.sender_type == SenderType.CHANNEL else "assistant",
+                    "content": msg.content,
+                    "created_at": msg.created_at.isoformat() if msg.created_at else None,
+                }
+                for msg in context_messages
+                if msg.content
+            ]
+
         # Create user message
         message_id = str(uuid4())
         user_message = await message_service.create_message(
@@ -108,6 +158,7 @@ async def send_message(request: SendMessageRequest) -> SendMessageResponse:
             receiver_id=channel.resident_agent_id,
             content=request.content,
             message_type=MessageType.TEXT,
+            metadata=message_metadata if message_metadata else None,
         )
 
         logger.info(f"Created user message {user_message.id} for channel {request.channel_id}")

@@ -1,6 +1,7 @@
 """
 Channels API for LongClaw.
 """
+import logging
 from datetime import datetime
 from typing import Any
 
@@ -11,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import db_manager
 from backend.models.channel import Channel, ChannelType
 from backend.services.channel_service import channel_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -137,7 +140,7 @@ async def get_channel(
 async def create_channel(
     data: ChannelCreate,
     session: AsyncSession = Depends(get_session),
-) -> Channel:
+) -> ChannelResponse:
     """Create a new channel.
 
     Args:
@@ -153,7 +156,32 @@ async def create_channel(
         config=data.config,
         resident_agent_id=data.resident_agent_id,
     )
-    return channel
+
+    # Commit the transaction so channel is visible to other sessions
+    await session.commit()
+
+    # Refresh the channel to ensure all attributes are loaded in the async context
+    await session.refresh(channel)
+
+    # Dynamically start web channel if agent is bound
+    if channel.channel_type == ChannelType.WEB and channel.resident_agent_id:
+        from backend.services.agent_registry import register_and_start_resident_agent
+        from backend.channels.web_channel import WebChannel
+
+        # Ensure agent is started
+        await register_and_start_resident_agent(channel.resident_agent_id)
+
+        # Start web channel
+        from backend.main import _web_channels
+        web_channel = WebChannel(
+            channel_id=channel.id,
+            resident_agent_id=channel.resident_agent_id,
+            config=channel.config,
+        )
+        await web_channel.start()
+        _web_channels[channel.id] = web_channel
+
+    return ChannelResponse.model_validate(channel)
 
 
 @router.put("/{channel_id}", response_model=ChannelResponse)
@@ -175,16 +203,58 @@ async def update_channel(
     Raises:
         HTTPException: If channel not found.
     """
+    from backend.main import _web_channels
+    from backend.services.agent_registry import register_and_start_resident_agent
+    from backend.channels.web_channel import WebChannel
+
     channel = await channel_service.get_channel(session, channel_id)
     if not channel:
         raise HTTPException(status_code=404, detail="Channel not found")
+
+    # Store old values to detect changes
+    old_is_active = channel.is_active
+    old_resident_agent_id = channel.resident_agent_id
 
     update_data = data.model_dump(exclude_unset=True)
     channel = await channel_service.update_channel(
         session, channel_id, **update_data
     )
 
-    return channel  # type: ignore
+    # Refresh the channel to ensure all attributes are loaded in the async context
+    await session.refresh(channel)
+
+    # Handle web channel activation/deactivation
+    if channel.channel_type == ChannelType.WEB:
+        new_is_active = channel.is_active
+        new_resident_agent_id = channel.resident_agent_id
+
+        # If channel is now active and has an agent, start it
+        if new_is_active and new_resident_agent_id:
+            # Start agent if needed
+            await register_and_start_resident_agent(new_resident_agent_id)
+
+            # Start or restart channel
+            if channel_id in _web_channels:
+                # Stop existing channel
+                old_channel = _web_channels.pop(channel_id)
+                await old_channel.stop()
+
+            # Start new channel
+            web_channel = WebChannel(
+                channel_id=channel.id,
+                resident_agent_id=new_resident_agent_id,
+                config=channel.config,
+            )
+            await web_channel.start()
+            _web_channels[channel.id] = web_channel
+
+        # If channel was deactivated, stop it
+        elif old_is_active and not new_is_active:
+            if channel_id in _web_channels:
+                old_channel = _web_channels.pop(channel_id)
+                await old_channel.stop()
+
+    return ChannelResponse.model_validate(channel)
 
 
 @router.delete("/{channel_id}")
@@ -204,9 +274,18 @@ async def delete_channel(
     Raises:
         HTTPException: If channel not found.
     """
+    # Stop web channel if running
+    from backend.main import _web_channels
+    if channel_id in _web_channels:
+        web_channel = _web_channels.pop(channel_id)
+        await web_channel.stop()
+
     deleted = await channel_service.delete_channel(session, channel_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Channel not found")
+
+    # Commit to ensure delete is persisted
+    await session.commit()
 
     return {"status": "deleted", "channel_id": channel_id}
 

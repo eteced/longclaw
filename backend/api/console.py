@@ -80,6 +80,22 @@ class InterventionRequest(BaseModel):
     target_id: str
 
 
+class SlotAllocationDisplay(BaseModel):
+    """Schema for slot allocation display."""
+
+    slot_id: str
+    agent_id: str
+    agent_name: str
+    agent_type: str
+    provider: str
+    model: str
+    slot_index: int
+    priority: int
+    priority_reason: str
+    operation_type: str
+    allocated_at: str | None
+
+
 class ConsoleOverview(BaseModel):
     """Schema for console overview."""
 
@@ -374,6 +390,19 @@ async def send_intervention(
         "target_type": data.target_type,
         "target_id": data.target_id,
     }
+
+
+@router.get("/slots", response_model=list[SlotAllocationDisplay])
+async def get_slot_allocations() -> list[SlotAllocationDisplay]:
+    """Get current slot allocations for display.
+
+    Returns:
+        List of slot allocations with agent info.
+    """
+    from backend.services.provider_scheduler_service import provider_scheduler_service
+
+    allocations = await provider_scheduler_service.get_all_allocations()
+    return [SlotAllocationDisplay(**a) for a in allocations]
 
 
 @router.get("/agent/{agent_id}/knowledge")

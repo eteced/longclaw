@@ -240,12 +240,91 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     WSMessage(type=WSMessageType.PONG).to_dict(),
                 )
 
+            elif action == "send_message":
+                channel_id = data.get("channel_id")
+                content = data.get("content")
+                if channel_id and content:
+                    await _route_message_to_agent(connection_id, channel_id, content)
+
     except WebSocketDisconnect:
         logger.info(f"WebSocket {connection_id} disconnected")
     except Exception as e:
         logger.exception(f"WebSocket error: {e}")
     finally:
         await connection_manager.disconnect(connection_id)
+
+
+async def _route_message_to_agent(connection_id: str, channel_id: str, content: str) -> None:
+    """Route a message from WebSocket to the correct agent.
+
+    Args:
+        connection_id: The WebSocket connection ID.
+        channel_id: The channel ID to send from.
+        content: The message content.
+    """
+    from backend.database import db_manager
+    from backend.models.message import MessageType, ReceiverType, SenderType
+    from backend.services.agent_registry import agent_registry
+    from backend.services.channel_service import channel_service
+
+    try:
+        async with db_manager.session() as session:
+            # Get the channel
+            channel = await channel_service.get_channel(session, channel_id)
+            if not channel:
+                await connection_manager.send_to_connection(
+                    connection_id,
+                    WSMessage(type="error", data={"error": "Channel not found"}).to_dict(),
+                )
+                return
+
+            if not channel.resident_agent_id:
+                await connection_manager.send_to_connection(
+                    connection_id,
+                    WSMessage(type="error", data={"error": "No agent bound to channel"}).to_dict(),
+                )
+                return
+
+            # Get the agent from registry
+            agent = agent_registry.get_agent(channel.resident_agent_id)
+            if not agent:
+                await connection_manager.send_to_connection(
+                    connection_id,
+                    WSMessage(type="error", data={"error": "Agent not running"}).to_dict(),
+                )
+                return
+
+            # Create message in database
+            message = await message_service.create_message(
+                session,
+                sender_type=SenderType.CHANNEL,
+                sender_id=channel_id,
+                receiver_type=ReceiverType.RESIDENT,
+                receiver_id=channel.resident_agent_id,
+                content=content,
+                message_type=MessageType.TEXT,
+            )
+
+        # Deliver message to agent's queue
+        await agent.receive_message(message)
+
+        # Confirm message was queued
+        await connection_manager.send_to_connection(
+            connection_id,
+            WSMessage(
+                type="message_queued",
+                data={"message_id": message.id, "channel_id": channel_id},
+            ).to_dict(),
+        )
+
+        logger.info(f"Message {message.id} routed to agent {channel.resident_agent_id} for channel {channel_id}")
+
+    except Exception as e:
+        logger.exception(f"Error routing message to agent: {e}")
+        await connection_manager.send_to_connection(
+            connection_id,
+            WSMessage(type="error", data={"error": str(e)}).to_dict(),
+        )
 
 
 async def broadcast_stream_chunk(

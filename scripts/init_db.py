@@ -154,6 +154,10 @@ DEFAULT_CONFIGS: dict[str, dict[str, Any]] = {
         "value": "false",
         "description": "强制所有任务走OwnerAgent复杂任务流程（用于测试）",
     },
+    "resident_always_allocate_slot": {
+        "value": "true",
+        "description": "Resident Agent是否始终占用模型Slot。关闭后，空闲时释放Slot给其他Agent",
+    },
 }
 
 # ==================== 预设配置方案 ====================
@@ -187,6 +191,7 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "context_compact_threshold": "0.8",
             "owner_confirm_dependencies": "true",
             "force_complex_task": "false",
+            "resident_always_allocate_slot": "true",
         },
     },
     "high_performance": {
@@ -217,6 +222,7 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "context_compact_threshold": "0.9",
             "owner_confirm_dependencies": "true",
             "force_complex_task": "false",
+            "resident_always_allocate_slot": "true",
         },
     },
     "unlimited": {
@@ -247,6 +253,7 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "context_compact_threshold": "0.95",
             "owner_confirm_dependencies": "true",
             "force_complex_task": "false",
+            "resident_always_allocate_slot": "true",
         },
     },
     "safe_mode": {
@@ -277,6 +284,7 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "context_compact_threshold": "0.7",
             "owner_confirm_dependencies": "true",
             "force_complex_task": "false",
+            "resident_always_allocate_slot": "false",
         },
     },
     "debug": {
@@ -307,6 +315,7 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "context_compact_threshold": "0.6",
             "owner_confirm_dependencies": "false",
             "force_complex_task": "true",
+            "resident_always_allocate_slot": "true",
         },
     },
 }
@@ -322,17 +331,36 @@ async def clear_tables(session) -> None:
     """
     from sqlalchemy import text
 
+    # 首先禁用外键检查（必须先做，否则 TRUNCATE 会失败）
+    try:
+        await session.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
+        logger.info("  已禁用外键检查")
+    except Exception:
+        pass
+
     # 按照外键依赖顺序清空表 (先清空有外键依赖的子表)
+    # 顺序原则：先清子表，再清父表
     tables = [
+        # messages 无强依赖，先清
         "messages",
+        # subtasks 依赖 tasks 和 agents
         "subtasks",
-        "tasks",
+        # model_slots 依赖多个表
+        "model_slots",
+        # conversations 依赖 channels 和 agents
         "conversations",
+        # tasks 依赖 agents (必须在 agents 之前清)
+        "tasks",
+        # knowledge 依赖 agents
         "knowledge",
+        # agent_prompts 和 agent_settings 依赖 agents
         "agent_prompts",
         "agent_settings",
+        # agents 必须在 tasks 之后清
         "agents",
+        # channels 依赖 agents
         "channels",
+        # config_profiles 和 system_config 无外键依赖，最后清
         "config_profiles",
         "system_config",
     ]
@@ -342,16 +370,23 @@ async def clear_tables(session) -> None:
     for table in tables:
         try:
             # 先尝试 TRUNCATE (更快)
-            await session.execute(text(f"TRUNCATE TABLE {table}"))
-            logger.info(f"  ✓ 已清空: {table}")
+            await session.execute(text(f"TRUNCATE TABLE `{table}`"))
+            logger.info(f"  ✓ 已清空: {table} (TRUNCATE)")
         except Exception:
             # TRUNCATE 失败则用 DELETE
             try:
-                await session.execute(text(f"DELETE FROM {table}"))
+                await session.execute(text(f"DELETE FROM `{table}`"))
                 logger.info(f"  ✓ 已清空: {table} (DELETE)")
             except Exception as e:
                 # 表可能不存在
                 logger.warning(f"  - 跳过: {table} ({e})")
+
+    # 重新启用外键检查
+    try:
+        await session.execute(text("SET FOREIGN_KEY_CHECKS = 1"))
+        logger.info("  已重新启用外键检查")
+    except Exception:
+        pass
 
     await session.commit()
     logger.info("  所有表已清空")

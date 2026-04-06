@@ -8,7 +8,7 @@
 - 前端: localhost:5173 (vite dev)
 - LLM: Qwen3.5-122B via llama.cpp (172.16.1.150:3721)
 - 浏览器: agent-browser CLI (独立 session)
-- API Key: longclaw_admin_2026
+- API Key: YOUR_API_KEY
 
 ---
 

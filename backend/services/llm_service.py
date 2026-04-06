@@ -2,6 +2,7 @@
 LLM Service for LongClaw.
 Provides unified interface for multiple LLM providers.
 """
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -219,6 +220,9 @@ class LLMService:
         self._configs: dict[str, LLMConfig] = {}
         self._http_client: httpx.AsyncClient | None = None
         self._load_configs()
+        # Semaphore control for provider+model concurrency
+        self._provider_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._semaphore_lock = asyncio.Lock()
 
     def _load_configs(self) -> None:
         """Load LLM configurations from settings."""
@@ -257,6 +261,30 @@ class LLMService:
         # Load config from database
         await load_db_config()
 
+    async def _get_semaphore(self, provider: str, model: str) -> asyncio.Semaphore:
+        """Get or create a semaphore for provider+model concurrency control.
+
+        Args:
+            provider: Provider name.
+            model: Model name.
+
+        Returns:
+            Semaphore for this provider+model combination.
+        """
+        key = f"{provider}:{model}"
+        async with self._semaphore_lock:
+            if key not in self._provider_semaphores:
+                # Get max_parallel_requests from ProviderScheduler
+                try:
+                    from backend.services.provider_scheduler_service import provider_scheduler_service
+                    max_parallel = provider_scheduler_service.get_model_max_parallel(provider, model)
+                except Exception as e:
+                    logger.warning(f"Failed to get max_parallel from provider_scheduler: {e}")
+                    max_parallel = 10  # Default fallback
+                self._provider_semaphores[key] = asyncio.Semaphore(max_parallel)
+                logger.debug(f"Created semaphore for {key} with max_parallel={max_parallel}")
+            return self._provider_semaphores[key]
+
     async def close(self) -> None:
         """Close the HTTP client."""
         if self._http_client:
@@ -287,7 +315,12 @@ class LLMService:
                 api_key = p.get("api_key", "")
                 base_url = p.get("base_url", "")
                 models = p.get("models", [])
-                model = models[0] if models else ""
+                # models is a list of dicts like {"name": "gpt-4o", "max_context_tokens": ...}
+                if models:
+                    first_model = models[0]
+                    model = first_model.get("name") if isinstance(first_model, dict) else str(first_model)
+                else:
+                    model = ""
 
                 if api_key:  # Only use db config if api_key is set
                     logger.debug(f"Using database config for provider: {provider_name}")
@@ -468,27 +501,44 @@ class LLMService:
             raise RuntimeError("LLM service not initialized")
 
         config = self.get_config(provider)
+        provider_name = provider or self._get_default_provider_name()
+
+        # Get semaphore for this provider+model and wait for available slot
+        semaphore = await self._get_semaphore(provider_name, config.model)
+
         url = f"{config.base_url.rstrip('/')}/chat/completions"
         headers = self._build_headers(config)
         body = self._build_request_body(config, messages, stream=False, tools=tools, **kwargs)
 
         logger.debug(f"Sending completion request to {url}")
         try:
-            response = await self._http_client.post(url, headers=headers, json=body)
-            response.raise_for_status()
+            # Wait for semaphore before making request
+            async with semaphore:
+                response = await self._http_client.post(url, headers=headers, json=body)
+                response.raise_for_status()
 
-            data = response.json()
-            # Log the finish_reason and tool_calls presence for debugging
-            choice = data.get("choices", [{}])[0]
-            finish_reason = choice.get("finish_reason", "")
-            message = choice.get("message", {})
-            has_tool_calls = "tool_calls" in message
-            logger.info(f"LLM response: finish_reason={finish_reason}, has_tool_calls={has_tool_calls}")
-            if has_tool_calls:
-                tool_call_names = [tc.get("function", {}).get("name", "") for tc in message.get("tool_calls", [])]
-                logger.info(f"Tool calls in response: {tool_call_names}")
+                data = response.json()
+                # Check for API-level errors
+                base_resp = data.get("base_resp", {})
+                status_code = base_resp.get("status_code", 0)
+                if status_code != 0:
+                    error_msg = base_resp.get("status_msg", str(data))
+                    raise RuntimeError(f"LLM API error: {error_msg}")
 
-            return LLMResponse.from_api_response(data)
+                # Log the finish_reason and tool_calls presence for debugging
+                choices = data.get("choices", [])
+                if not choices:
+                    raise RuntimeError(f"LLM API returned empty choices: {data}")
+                choice = choices[0]
+                finish_reason = choice.get("finish_reason", "")
+                message = choice.get("message", {})
+                has_tool_calls = "tool_calls" in message
+                logger.info(f"LLM response: finish_reason={finish_reason}, has_tool_calls={has_tool_calls}")
+                if has_tool_calls:
+                    tool_call_names = [tc.get("function", {}).get("name", "") for tc in message.get("tool_calls", [])]
+                    logger.info(f"Tool calls in response: {tool_call_names}")
+
+                return LLMResponse.from_api_response(data)
         except httpx.ConnectError as e:
             # Provide user-friendly connection error message
             error_msg = (
@@ -568,11 +618,31 @@ class LLMService:
                         break
                     try:
                         chunk = json.loads(data)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        # Check if the response contains an error (non-zero status in base_resp)
+                        base_resp = chunk.get("base_resp", {})
+                        status_code = base_resp.get("status_code", 0)
+                        has_error = "error" in chunk or (status_code != 0)
+
+                        # Handle error response
+                        if has_error:
+                            error_msg = chunk.get("error", {}).get("message") or base_resp.get("status_msg", str(chunk))
+                            raise RuntimeError(f"LLM API error: {error_msg}")
+
+                        # Handle normal response
+                        choices = chunk.get("choices")
+                        if not choices:
+                            # Empty choices is not an error, just skip
+                            continue
+                        delta = choices[0].get("delta", {})
                         content = delta.get("content", "")
                         if content:
                             yield content
                     except json.JSONDecodeError:
+                        continue
+                    except RuntimeError:
+                        raise
+                    except (IndexError, KeyError) as e:
+                        # Handle malformed responses - skip them
                         continue
 
     async def complete_stream_with_tools(
@@ -629,7 +699,17 @@ class LLMService:
                         break
                     try:
                         chunk = json.loads(data)
-                        choice = chunk.get("choices", [{}])[0]
+                        # Check for API-level errors
+                        base_resp = chunk.get("base_resp", {})
+                        status_code = base_resp.get("status_code", 0)
+                        if status_code != 0:
+                            error_msg = base_resp.get("status_msg", str(chunk))
+                            raise RuntimeError(f"LLM API error: {error_msg}")
+
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue  # Skip empty chunks
+                        choice = choices[0]
                         delta = choice.get("delta", {})
                         finish_reason = choice.get("finish_reason")
 

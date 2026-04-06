@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy import select
+
 from backend.database import db_manager
 from backend.models.agent import Agent, AgentStatus, AgentType
 from backend.models.message import Message, MessageType, SenderType, ReceiverType
@@ -435,7 +437,10 @@ class BaseAgent(ABC):
         if not self._id:
             await self.persist()
 
-        if self._status == AgentStatus.RUNNING:
+        # Check if already running with an active task
+        # _run_task being None means the agent was loaded but never started in this process
+        # (e.g., after a backend restart)
+        if self._status == AgentStatus.RUNNING and self._run_task is not None and not self._run_task.done():
             logger.warning(f"Agent {self._id} is already running")
             return
 
@@ -528,7 +533,7 @@ class BaseAgent(ABC):
         """Resolve the effective model for this agent.
 
         Resolution order:
-        1. Agent's own model_assignment field
+        1. Agent's own model_assignment field (refreshed from DB to pick up scheduler allocations)
         2. Instance-level AgentSettings for this agent_id
         3. Type-level AgentSettings for this agent_type
         4. None (use default from ModelConfigService)
@@ -537,12 +542,20 @@ class BaseAgent(ABC):
             Tuple of (provider_name, model_name) or (None, None) for default.
         """
         # Check agent's own model_assignment first
-        if self._model and hasattr(self._model, 'model_assignment') and self._model.model_assignment:
-            provider = self._model.model_assignment.get('provider')
-            model = self._model.model_assignment.get('model')
-            if provider and model:
-                logger.debug(f"Using model from model_assignment: {provider}/{model}")
-                return (provider, model)
+        # IMPORTANT: We must reload from DB because the provider scheduler updates
+        # model_assignment in a separate session and we need fresh data
+        if self._id:
+            async with db_manager.session() as session:
+                result = await session.execute(
+                    select(Agent).where(Agent.id == self._id)
+                )
+                db_agent = result.scalar_one_or_none()
+                if db_agent and db_agent.model_assignment:
+                    provider = db_agent.model_assignment.get('provider')
+                    model = db_agent.model_assignment.get('model')
+                    if provider and model:
+                        logger.debug(f"Using model from model_assignment: {provider}/{model}")
+                        return (provider, model)
 
         # Check AgentSettings
         if self._id:

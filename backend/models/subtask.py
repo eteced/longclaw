@@ -20,6 +20,7 @@ class SubtaskStatus(str, enum.Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    TERMINATED = "terminated"
 
 
 class Subtask(Base):

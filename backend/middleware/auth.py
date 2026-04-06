@@ -21,7 +21,11 @@ class AuthMiddleware:
         "/openapi.json",
         "/redoc",
         "/api/ws",  # WebSocket endpoint
+        "/api/verify",  # API key verification (used during login)
     ]
+
+    # Minimum API key length for security
+    MIN_API_KEY_LENGTH = 16
 
     def __init__(self, app: ASGIApp) -> None:
         """Initialize the middleware.
@@ -63,6 +67,18 @@ class AuthMiddleware:
 
         # Validate API key
         settings = get_settings()
+
+        # Check if API key is set and valid
+        if not settings.api_key:
+            # Send 500 response - server misconfigured
+            response = Response(
+                content='{"detail":"Server misconfigured: API_KEY not set. Please set a secure API_KEY environment variable."}',
+                status_code=500,
+                media_type="application/json",
+            )
+            await response(scope, receive, send)
+            return
+
         if not api_key or api_key != settings.api_key:
             # Send 401 response
             response = Response(

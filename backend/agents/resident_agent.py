@@ -164,10 +164,29 @@ class ResidentAgent(BaseAgent):
         # Update heartbeat to show agent is active
         await self._touch()
 
+        # Extract context from message metadata (loaded from database in chat.py)
+        # This provides multi-turn context persistence across agent restarts
+        context_messages = []
+        if message.message_metadata and "context_messages" in message.message_metadata:
+            try:
+                context_data = message.message_metadata["context_messages"]
+                if isinstance(context_data, list):
+                    for ctx in context_data:
+                        role = ctx.get("role", "user")
+                        content = ctx.get("content", "")
+                        if content:
+                            context_messages.append(ChatMessage(role=role, content=content))
+                    logger.info(f"Loaded {len(context_messages)} context messages from database")
+            except Exception as e:
+                logger.warning(f"Failed to parse context from message metadata: {e}")
+
+        # Rebuild conversation history from database context
+        # This ensures agent has full context even after restart
+        self._conversation_history = context_messages[:]
+
         # Add user message to history
         user_msg = ChatMessage(role="user", content=message.content or "")
         self._conversation_history.append(user_msg)
-        self._trim_history()
 
         # Extract channel_id from message if sender is CHANNEL
         channel_id = None
@@ -557,6 +576,48 @@ class ResidentAgent(BaseAgent):
 
         return result
 
+    def _build_conversation_context(self, max_chars: int = 2000) -> str:
+        """Build a context string from conversation history.
+
+        This extracts recent user/assistant messages to provide context
+        for task execution. This ensures the Owner Agent knows about
+        previous discussion context (e.g., file paths, working directories).
+
+        Args:
+            max_chars: Maximum characters to include.
+
+        Returns:
+            Context string with recent conversation, or empty string if none.
+        """
+        if not self._conversation_history:
+            return ""
+
+        # Build context from recent messages, skipping very long messages
+        # (like report summaries that don't help with context)
+        context_parts = []
+        total_chars = 0
+
+        # Iterate in chronological order (oldest first)
+        for msg in self._conversation_history:
+            if msg.role == "system":
+                continue
+
+            # Skip very long messages (likely report summaries)
+            if msg.content and len(msg.content) > 1000:
+                continue
+
+            msg_text = f"{'用户' if msg.role == 'user' else '助手'}: {msg.content}"
+            if total_chars + len(msg_text) > max_chars:
+                break
+
+            context_parts.append(msg_text)
+            total_chars += len(msg_text)
+
+        if not context_parts:
+            return ""
+
+        return "【对话历史上下文】\n" + "\n".join(context_parts) + "\n【以上是对话历史，当前任务继承上述上下文】\n\n"
+
     async def _execute_task(self, user_request: str, channel_id: str | None = None) -> str:
         """Execute a task using tools or OwnerAgent.
 
@@ -573,15 +634,22 @@ class ResidentAgent(BaseAgent):
         """
         logger.info(f"Executing task: {user_request[:100]}...")
 
+        # Build context from conversation history for multi-turn context
+        context = self._build_conversation_context()
+        if context:
+            logger.info(f"Including conversation context ({len(context)} chars) for task execution")
+
         # Create a Task record for tracking (for ALL tasks)
         task_id = None
         try:
             async with db_manager.session() as session:
+                # Include context in description so OwnerAgent has full context
+                full_description = (context + user_request) if context else user_request
                 task = await task_service.create_task(
                     session,
                     title=user_request[:100] + ("..." if len(user_request) > 100 else ""),
-                    description=user_request,
-                    original_message=user_request,
+                    description=full_description,
+                    original_message=full_description,
                     channel_id=channel_id,  # Use the actual channel_id from message
                 )
                 task_id = task.id
@@ -593,12 +661,15 @@ class ResidentAgent(BaseAgent):
         is_complex = await self._is_complex_task(user_request)
         logger.info(f"Task complexity check: is_complex={is_complex}")
 
+        # Build full request with context for OwnerAgent
+        full_request = (context + user_request) if context else user_request
+
         if is_complex:
             logger.info("Complex task detected, delegating to OwnerAgent")
-            result = await self._delegate_to_owner_agent(user_request, task_id)
+            result = await self._delegate_to_owner_agent(full_request, task_id)
         else:
             # Simple task: use direct tool-use loop
-            result = await self._execute_with_tools(user_request)
+            result = await self._execute_with_tools(full_request)
 
             # Update task status to completed
             if task_id:
@@ -889,18 +960,25 @@ class ResidentAgent(BaseAgent):
             Generated response.
         """
         try:
-            # Build messages for LLM
+            # Build messages for LLM - use conversation history for multi-turn context
             messages = list(self._conversation_history)
 
             # Get tool definitions for chat mode too (allows web_search during chat)
             tools = tool_service.get_tool_definitions()
-            logger.info(f"Chat mode: {len(tools)} tools available")
+            logger.info(f"Chat mode: {len(tools)} tools available, {len(messages)} messages in history")
 
             # Use think_with_tools to allow tool calls during chat
             response = await self.think_with_tools(messages, tools=tools)
 
             # Check if LLM wants to call tools
             if response.has_tool_calls:
+                # Add assistant message with tool calls to history first
+                self._conversation_history.append(ChatMessage(
+                    role="assistant",
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                ))
+
                 # Process tool calls
                 for tool_call in response.tool_calls or []:
                     logger.info(f"Chat mode: Executing tool: {tool_call.name}")
@@ -908,17 +986,22 @@ class ResidentAgent(BaseAgent):
                         tool_call.name,
                         **tool_call.arguments
                     )
-                    # Add tool result to conversation
+                    # Add tool result to conversation history (for multi-turn persistence)
                     result_content = tool_result.content
                     if not tool_result.success and tool_result.error:
                         result_content = f"错误: {tool_result.error}"
 
-                    messages.append(ChatMessage(
+                    tool_msg = ChatMessage(
                         role="tool",
                         content=result_content,
                         tool_call_id=tool_call.id,
                         name=tool_call.name,
-                    ))
+                    )
+                    self._conversation_history.append(tool_msg)
+                    messages.append(tool_msg)
+
+                # Trim history to prevent unbounded growth
+                self._trim_history()
 
                 # Get final response after tool execution
                 response = await self.think_with_tools(messages, tools=tools)

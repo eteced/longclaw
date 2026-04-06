@@ -1,6 +1,6 @@
 """
 Database migration script for LongClaw.
-Adds error_message column to agents table.
+Adds error_message column to agents table and model_slots table.
 """
 import asyncio
 import logging
@@ -61,6 +61,45 @@ async def migrate():
                 logger.info("Successfully created model_configs table")
             else:
                 logger.info("model_configs table already exists")
+
+            # Create model_slots table if not exists
+            result = await conn.execute(
+                text("SHOW TABLES LIKE 'model_slots'")
+            )
+            table_exists = result.fetchone()
+
+            if not table_exists:
+                logger.info("Creating model_slots table...")
+                await conn.execute(
+                    text("""
+                        CREATE TABLE model_slots (
+                            id VARCHAR(36) PRIMARY KEY,
+                            agent_id VARCHAR(36) NOT NULL,
+                            provider_name VARCHAR(100) NOT NULL,
+                            model_name VARCHAR(100) NOT NULL,
+                            priority INT DEFAULT 0,
+                            priority_reason TEXT NULL,
+                            allocated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            last_heartbeat DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                            is_active BOOLEAN DEFAULT TRUE,
+                            is_released BOOLEAN DEFAULT FALSE,
+                            released_at DATETIME NULL,
+                            slot_index INT DEFAULT 0,
+                            operation_type VARCHAR(50) NULL,
+                            task_id VARCHAR(36) NULL,
+                            subtask_id VARCHAR(36) NULL,
+                            INDEX idx_agent_id (agent_id),
+                            INDEX idx_provider_name (provider_name),
+                            INDEX idx_task_id (task_id),
+                            FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+                            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE SET NULL,
+                            FOREIGN KEY (subtask_id) REFERENCES subtasks(id) ON DELETE SET NULL
+                        )
+                    """)
+                )
+                logger.info("Successfully created model_slots table")
+            else:
+                logger.info("model_slots table already exists")
 
         logger.info("Migration completed successfully")
 

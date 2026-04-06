@@ -11,11 +11,12 @@ from backend.agents.sub_agent import SubAgent
 from backend.agents.base_agent import TimeoutManager
 from backend.database import db_manager
 from backend.models.agent import AgentType, AgentStatus
-from backend.models.message import Message
+from backend.models.message import Message, MessageType, SenderType, ReceiverType
 from backend.models.subtask import SubtaskStatus
 from backend.services.agent_settings_service import agent_settings_service
 from backend.services.config_service import config_service
 from backend.services.llm_service import ChatMessage
+from backend.services.message_service import message_service
 from backend.services.task_service import task_service
 from backend.services.tool_service import tool_service
 
@@ -78,6 +79,18 @@ WORKER_AGENT_SYSTEM_PROMPT = """你是一个执行型 Agent，负责完成特定
 - ✅ 搜索结果摘要有数据 → 直接用
 - ✅ 摘要没数据但有关联 URL → web_fetch 获取
 - ✅ 确实找不到 → 如实报告 "搜索结果中未找到 xxx 信息"
+
+## ⚠️ 目标不明确时的处理
+
+如果任务描述缺少以下关键信息，你应该要求澄清而不是盲目执行：
+- 不清楚具体要搜索什么关键词
+- 不清楚要操作的文件夹/文件路径
+- 不清楚最终的输出格式要求
+
+【不明确时的处理方式】
+- 在执行前，先说明你需要的额外信息
+- 使用消息格式向 OwnerAgent 提问
+- 等待回复后再继续执行
 
 ## 输出要求
 - 基于实际获取的信息回答
@@ -143,6 +156,9 @@ class WorkerAgent(SubAgent):
         self._execution_messages: list[ChatMessage] = []
         self._completed = asyncio.Event()
         self._progress_callback: Any = None  # Optional callback to signal progress
+        # Cancellation mechanism for immediate termination
+        self._cancellation_event = asyncio.Event()
+        self._cancel_requested = False
 
         # Dynamic timeout manager - no max extension limit, extend as long as there's progress
         self._timeout_manager = TimeoutManager(
@@ -150,6 +166,148 @@ class WorkerAgent(SubAgent):
             max_extension=0,  # No limit - extend as long as there's progress
             min_progress_interval=30,
         )
+
+        # Multi-round communication with OwnerAgent
+        self._pending_question: str | None = None  # Question sent to Owner waiting for response
+        self._waiting_for_owner_response: bool = False  # True if waiting for Owner response
+        self._owner_response_event = asyncio.Event()  # Event to signal when Owner responds
+
+    async def _check_and_request_context(self, task_description: str) -> bool:
+        """Check if context is sufficient. If not, ask OwnerAgent and wait.
+
+        This method analyzes the task description to detect if critical information
+        is missing. If so, it sends a QUESTION message to OwnerAgent and waits
+        for a response.
+
+        Args:
+            task_description: The task description to analyze.
+
+        Returns:
+            True if context is sufficient to proceed.
+            False if waiting for OwnerAgent response (status changed to WAITING).
+        """
+        # Simple heuristics to detect unclear context
+        unclear_indicators = [
+            ("关键词", "具体要搜索什么关键词"),
+            ("文件夹", "要操作的文件夹路径"),
+            ("文件路径", "要操作的文件路径"),
+            ("格式要求", "最终的输出格式要求"),
+            ("具体", "缺少具体信息"),
+            ("帮我", "没有说明具体要做什么"),
+            ("处理", "没有说明如何处理"),
+        ]
+
+        # Check if task description is too vague
+        needs_clarification = False
+        clarification_question = None
+
+        # If task description is very short, likely needs clarification
+        if len(task_description) < 20:
+            needs_clarification = True
+            clarification_question = "任务描述太简略了，请提供更具体的信息：你要搜索什么主题？需要获取哪些具体信息？"
+        # Check for missing key information
+        elif "搜索" in task_description or "查询" in task_description:
+            # These tasks need specific keywords
+            if not any(keyword in task_description for keyword in ["关于", "有关", "什么", "哪些", "币", "股", "新闻", "价格"]):
+                needs_clarification = True
+                clarification_question = "请明确你要搜索的关键词。例如：'搜索比特币最新价格' 而不是仅仅说'搜索价格'"
+
+        if needs_clarification and clarification_question:
+            logger.info(f"WorkerAgent {self._id} needs clarification: {clarification_question}")
+
+            # Update status to WAITING
+            await self._update_status(AgentStatus.WAITING)
+            self._waiting_for_owner_response = True
+            self._pending_question = clarification_question
+
+            # Release slot so other agents can use the model
+            from backend.services.provider_scheduler_service import provider_scheduler_service
+            await provider_scheduler_service.release_slot(self._id)
+
+            # Send QUESTION message to OwnerAgent
+            try:
+                async with db_manager.session() as session:
+                    await message_service.create_message(
+                        session,
+                        sender_type=SenderType.WORKER,
+                        sender_id=self._id,
+                        receiver_type=ReceiverType.OWNER,
+                        receiver_id=self._parent_agent_id,
+                        content=f"[{self._name}] 需要澄清: {clarification_question}",
+                        message_type=MessageType.QUESTION,
+                        task_id=self._task_id,
+                        subtask_id=self._subtask_id,
+                    )
+                    logger.info(f"WorkerAgent {self._id} sent QUESTION to OwnerAgent {self._parent_agent_id}")
+            except Exception as e:
+                logger.error(f"Failed to send QUESTION message: {e}")
+                # Revert status if message sending fails
+                await self._update_status(AgentStatus.RUNNING)
+                self._waiting_for_owner_response = False
+                self._pending_question = None
+                return True  # Continue anyway
+
+            # Wait for Owner response with polling
+            # Poll for TEXT messages from Owner - configured via worker_waiting_owner_timeout
+            max_wait_time = await config_service.get_float("worker_waiting_owner_timeout", 120.0)
+            poll_interval = 0.5
+            waited = 0
+
+            # If max_wait_time is None (unlimited/-1), set to a very large number for the loop
+            # get_float returns None when config value is -1 (unlimited)
+            if max_wait_time is None or max_wait_time < 0:
+                max_wait_time = float('inf')
+
+            while waited < max_wait_time:
+                if self._cancel_requested:
+                    logger.info(f"WorkerAgent {self._id} cancellation requested while waiting for owner")
+                    return False
+
+                # Check for Owner response in database
+                try:
+                    async with db_manager.session() as session:
+                        from sqlalchemy import select, and_
+                        from backend.models.message import Message
+
+                        result = await session.execute(
+                            select(Message)
+                            .where(
+                                and_(
+                                    Message.receiver_id == self._id,
+                                    Message.sender_id == self._parent_agent_id,
+                                    Message.message_type == MessageType.TEXT
+                                )
+                            )
+                            .order_by(Message.created_at.desc())
+                            .limit(1)
+                        )
+                        response_msg = result.scalar_one_or_none()
+
+                        if response_msg:
+                            logger.info(f"WorkerAgent {self._id} received response from Owner: {response_msg.content[:100]}...")
+                            # Add Owner response to execution context
+                            self._execution_messages.append(
+                                ChatMessage(role="system", content=f"OwnerAgent回复: {response_msg.content}")
+                            )
+                            self._waiting_for_owner_response = False
+                            self._pending_question = None
+                            return True
+                except Exception as e:
+                    logger.warning(f"Error polling for owner response: {e}")
+
+                await asyncio.sleep(poll_interval)
+                waited += poll_interval
+
+            # Timeout waiting for response
+            if max_wait_time == float('inf'):
+                logger.warning(f"WorkerAgent {self._id} timed out waiting for Owner response (unlimited mode)")
+            else:
+                logger.warning(f"WorkerAgent {self._id} timed out waiting for Owner response after {max_wait_time}s")
+            self._waiting_for_owner_response = False
+            self._pending_question = None
+            # Continue anyway with original context
+
+        return True
 
     async def execute(self, task_description: str) -> str:
         """Execute a subtask and return the result.
@@ -212,6 +370,20 @@ class WorkerAgent(SubAgent):
             ChatMessage(role="user", content=task_description)
         ]
 
+        # Check if context is sufficient before starting execution
+        # If not, this will send a QUESTION to Owner and wait for response
+        if not await self._check_and_request_context(task_description):
+            # Was cancelled while waiting
+            self._result = "任务已被终止"
+            self._completed.set()
+            await self._update_status(AgentStatus.TERMINATED)
+            if self._subtask_id:
+                await self._update_subtask_status(
+                    SubtaskStatus.TERMINATED,
+                    error="任务被用户终止",
+                )
+            return self._result
+
         # Get tool definitions for the tools this agent can use
         all_tools = tool_service.get_tool_definitions()
         available_tools = [
@@ -225,8 +397,8 @@ class WorkerAgent(SubAgent):
             self._result = result
             self._completed.set()
 
-            # Update agent status to IDLE (completed)
-            await self._update_status(AgentStatus.IDLE)
+            # Update agent status to DONE (completed normally)
+            await self._update_status(AgentStatus.DONE)
 
             # Update subtask status to COMPLETED
             if self._subtask_id:
@@ -236,6 +408,24 @@ class WorkerAgent(SubAgent):
                 )
 
             return result
+
+        except asyncio.CancelledError:
+            # Termination requested - this is not an error, it's intentional
+            logger.info(f"WorkerAgent {self._id} execution cancelled")
+            self._result = self._result or "任务已被终止"
+            self._completed.set()
+
+            # Update agent status to TERMINATED
+            await self._update_status(AgentStatus.TERMINATED)
+
+            # Update subtask status to TERMINATED
+            if self._subtask_id:
+                await self._update_subtask_status(
+                    SubtaskStatus.TERMINATED,
+                    error="任务被用户终止",
+                )
+
+            return self._result
 
         except asyncio.TimeoutError:
             current_timeout = self._timeout_manager.get_current_timeout()
@@ -356,11 +546,15 @@ class WorkerAgent(SubAgent):
             logger.warning(f"Failed to update WorkerAgent {self._id} status: {e}")
 
     async def terminate(self) -> None:
-        """Terminate the WorkerAgent.
+        """Terminate the WorkerAgent immediately.
 
-        Sets the agent status to TERMINATED in the database.
-        This should be called by the OwnerAgent when it terminates.
+        Sets the cancellation flag which will stop execution at the next
+        check point (between tool rounds). Also updates DB status.
         """
-        logger.info(f"WorkerAgent {self._id} terminating")
-        await self._update_status(AgentStatus.TERMINATED)
+        logger.info(f"WorkerAgent {self._id} termination requested")
+        # Set cancellation flag to stop execution at next check point
+        self._cancel_requested = True
+        self._cancellation_event.set()
         self._completed.set()
+        # Update status in database
+        await self._update_status(AgentStatus.TERMINATED)

@@ -42,6 +42,7 @@ class MessageType(str, enum.Enum):
     REPORT = "report"
     ERROR = "error"
     SYSTEM = "system"
+    QUESTION = "question"  # Worker asking Owner for clarification
 
 
 class Message(Base):

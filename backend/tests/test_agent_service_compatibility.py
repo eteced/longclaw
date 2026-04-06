@@ -6,6 +6,7 @@ This test suite verifies:
 2. Agent persist() calls Service with correct arguments
 3. Message creation for agent actions works correctly
 """
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, ANY
 import inspect
@@ -274,6 +275,7 @@ class TestAgentMessageRecording:
             mock_worker._name = "Worker-1"
             mock_worker._subtask_id = "subtask-789"
             mock_worker.status = AgentStatus.IDLE
+            mock_worker._persist = AsyncMock(return_value="worker-456")
             mock_worker.execute = AsyncMock(return_value="Task result")
 
             # Mock message_service imported inside _run_worker
@@ -320,6 +322,7 @@ class TestAgentMessageRecording:
             mock_worker._name = "Worker-1"
             mock_worker._subtask_id = "subtask-789"
             mock_worker.status = AgentStatus.IDLE
+            mock_worker._persist = AsyncMock(return_value="worker-456")
             mock_worker.execute = AsyncMock(return_value="Task completed successfully")
 
             with patch('backend.services.message_service.message_service') as mock_msg_service:
@@ -367,6 +370,7 @@ class TestAgentMessageRecording:
             mock_worker._name = "Worker-1"
             mock_worker._subtask_id = "subtask-789"
             mock_worker.status = AgentStatus.ERROR
+            mock_worker._persist = AsyncMock(return_value="worker-456")
             mock_worker.execute = AsyncMock(side_effect=Exception("Test error"))
 
             with patch('backend.services.message_service.message_service') as mock_msg_service:
@@ -552,3 +556,141 @@ class TestReflectAgentMessageCreation:
             assert call_kwargs['receiver_id'] == "parent-789"
             assert "child-456" in call_kwargs['content']
             assert "Timeout exceeded" in call_kwargs['content']
+
+
+class TestSubAgentTermination:
+    """Test SubAgent cancellation and termination behavior."""
+
+    @pytest.mark.asyncio
+    async def test_sub_agent_terminate_sets_cancel_flag(self):
+        """SubAgent.terminate should set _cancel_requested flag."""
+        agent = SubAgent(name="TestAgent", task_id="task-123")
+
+        assert agent._cancel_requested is False
+
+        with patch.object(agent, '_update_status', AsyncMock()):
+            await agent.terminate()
+
+        assert agent._cancel_requested is True
+        assert agent._cancellation_event.is_set() is True
+
+    @pytest.mark.asyncio
+    async def test_sub_agent_execute_checks_cancel_flag(self):
+        """SubAgent._execute_with_tools should check _cancel_requested at start of each round."""
+        agent = SubAgent(name="TestAgent", task_id="task-123")
+        agent._cancel_requested = True  # Simulate termination requested
+
+        # Mock dependencies that would access database/config
+        with patch('backend.services.config_service.ConfigService.get_int', new_callable=AsyncMock) as mock_get_int, \
+             patch('backend.agents.sub_agent.tool_service') as mock_tool:
+            mock_get_int.return_value = 10  # max_tool_rounds
+            mock_tool.get_tool_definitions.return_value = []
+
+            # The method should raise CancelledError when cancellation is requested
+            with pytest.raises(asyncio.CancelledError):
+                await agent._execute_with_tools([])
+
+
+class TestWorkerAgentTermination:
+    """Test WorkerAgent termination behavior."""
+
+    @pytest.mark.asyncio
+    async def test_worker_agent_terminate_sets_cancel_flag(self):
+        """WorkerAgent.terminate should set _cancel_requested flag."""
+        agent = WorkerAgent(name="TestWorker", task_id="task-123")
+
+        assert agent._cancel_requested is False
+
+        with patch.object(agent, '_update_status', AsyncMock()):
+            await agent.terminate()
+
+        assert agent._cancel_requested is True
+        assert agent._cancellation_event.is_set() is True
+
+    @pytest.mark.asyncio
+    async def test_worker_agent_execute_propagates_llm_errors(self):
+        """WorkerAgent should mark subtask as FAILED when LLM raises exception."""
+        agent = WorkerAgent(name="TestWorker", task_id="task-123", subtask_id="subtask-456")
+
+        # Mock all database/config access points
+        with patch.object(agent, '_persist', new_callable=AsyncMock) as mock_persist, \
+             patch.object(agent, '_execute_with_tools', side_effect=RuntimeError("LLM connection failed")), \
+             patch.object(agent, '_update_status', AsyncMock()), \
+             patch.object(agent, '_update_subtask_status', AsyncMock()), \
+             patch('backend.services.config_service.ConfigService.get_float', new_callable=AsyncMock) as mock_get_float, \
+             patch('backend.services.config_service.ConfigService.get_int', new_callable=AsyncMock) as mock_get_int, \
+             patch('backend.services.agent_settings_service.agent_settings_service.get_type_settings', new_callable=AsyncMock) as mock_get_settings:
+
+            mock_persist.return_value = "worker-123"  # Simulate persist returning an ID
+            mock_get_float.return_value = 300.0
+            mock_get_int.return_value = 10
+            mock_get_settings.return_value = None
+
+            result = await agent.execute("Test task")
+
+            # Should return error message
+            assert "LLM connection failed" in result
+            assert agent._result == "执行出错: LLM connection failed"
+
+
+class TestOwnerAgentContext:
+    """Test OwnerAgent context passing to workers."""
+
+    def test_build_worker_context_includes_cwd(self):
+        """_build_worker_context should include current working directory."""
+        agent = OwnerAgent(task_id="task-123")
+        context = agent._build_worker_context()
+
+        import os
+        assert os.getcwd() in context
+        assert "当前工作目录" in context
+
+    def test_validate_task_context_warns_on_short_description(self):
+        """_validate_task_context should warn for very short descriptions."""
+        agent = OwnerAgent(task_id="task-123")
+        spec = MagicMock()
+        spec.id = "1"
+        spec.tools_needed = ["web_search"]
+
+        # Very short description should fail validation
+        result = agent._validate_task_context(spec, "hi")
+
+        assert result is False
+
+    def test_validate_task_context_warns_on_missing_context_for_execute_command(self):
+        """_validate_task_context should warn when execute_command lacks context."""
+        agent = OwnerAgent(task_id="task-123")
+        spec = MagicMock()
+        spec.id = "1"
+        spec.tools_needed = ["execute_command"]
+
+        # Description without context keywords should fail
+        result = agent._validate_task_context(spec, "run something")
+
+        assert result is False
+
+    def test_validate_task_context_passes_with_sufficient_context(self):
+        """_validate_task_context should pass with sufficient context."""
+        agent = OwnerAgent(task_id="task-123")
+        spec = MagicMock()
+        spec.id = "1"
+        spec.tools_needed = ["execute_command"]
+
+        # Description with context keywords should pass
+        result = agent._validate_task_context(
+            spec,
+            "在 /home/user/project 目录下编译运行 C++ 代码"
+        )
+
+        assert result is True
+
+
+class TestSubtaskStatusTermination:
+    """Test SubtaskStatus.TERMINATED enum value."""
+
+    def test_subtask_status_has_terminated(self):
+        """SubtaskStatus should have TERMINATED value."""
+        from backend.models.subtask import SubtaskStatus
+
+        assert hasattr(SubtaskStatus, 'TERMINATED')
+        assert SubtaskStatus.TERMINATED.value == "terminated"

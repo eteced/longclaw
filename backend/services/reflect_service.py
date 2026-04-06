@@ -84,6 +84,11 @@ class ReflectService:
                     f"Agent {analysis.agent_id} needs intervention: {analysis.reason}"
                 )
 
+                # Check if we should mark agent as DONE (worker completed normally)
+                if "responded done" in (analysis.reason or ""):
+                    await self._mark_agent_done(analysis.agent_id, analysis.reason or "")
+                    continue
+
                 if analysis.should_terminate:
                     # Mark agent as error
                     await self._mark_agent_error(analysis.agent_id, analysis.reason or "")
@@ -121,6 +126,27 @@ class ReflectService:
                 logger.warning(f"Marked agent {agent_id} as ERROR: {reason}")
         except Exception as e:
             logger.error(f"Failed to mark agent as error: {e}")
+
+    async def _mark_agent_done(self, agent_id: str, reason: str) -> None:
+        """Mark an agent as DONE (completed normally).
+
+        Args:
+            agent_id: The agent ID.
+            reason: The reason for marking as done.
+        """
+        try:
+            async with db_manager.session() as session:
+                from backend.services.agent_service import agent_service
+
+                await agent_service.update_status(session, agent_id, AgentStatus.DONE)
+                await agent_service.update_agent(
+                    session,
+                    agent_id,
+                    personality=f"Completed normally: {reason}",
+                )
+                logger.info(f"Marked agent {agent_id} as DONE: {reason}")
+        except Exception as e:
+            logger.error(f"Failed to mark agent as done: {e}")
 
     async def _report_to_parent_if_needed(self, agent_id: str, reason: str) -> None:
         """Report failure to parent agent if exists.

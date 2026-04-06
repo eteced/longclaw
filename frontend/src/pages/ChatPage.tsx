@@ -37,8 +37,18 @@ export const ChatPage: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [channel, setChannel] = useState<WebChannel | null>(null);
+  const [channels, setChannels] = useState<WebChannel[]>([]);
+  const [selectedChannelIndex, setSelectedChannelIndex] = useState(0);
+  const [agents, setAgents] = useState<Map<string, { name: string }>>(new Map());
   const [error, setError] = useState<string | null>(null);
+
+  // Derived state for current channel
+  const channel = channels[selectedChannelIndex] || null;
+
+  // Get current agent name
+  const currentAgentName = channel?.resident_agent_id
+    ? agents.get(channel.resident_agent_id)?.name || 'Agent'
+    : 'Chat';
   const [sendError, setSendError] = useState<string | null>(null);
   const [showInitDialog, setShowInitDialog] = useState(false);
   const [isInitializing, setIsInitializing] = useState(false);
@@ -259,60 +269,87 @@ export const ChatPage: React.FC = () => {
           }
         }
 
-        // Database is initialized, fetch the channel
-        await fetchChannel();
+        // Database is initialized, fetch the channels
+        await fetchChannelsAndAgents();
       } catch (err) {
         console.error('[ChatPage] Failed to check init status:', err);
-        // Try to fetch channel anyway as fallback
-        await fetchChannel();
+        // Try to fetch channels anyway as fallback
+        await fetchChannelsAndAgents();
       }
     };
 
-    const fetchChannel = async () => {
+    const fetchChannelsAndAgents = async () => {
       try {
         const apiKey = api.getApiKey();
-        console.log('[ChatPage] Fetching web channel, API key exists:', !!apiKey);
+        console.log('[ChatPage] Fetching channels and agents, API key exists:', !!apiKey);
 
-        // Use dedicated web-channel API
-        const response = await fetch('/api/chat/web-channel', {
+        // Fetch all channels using the channels API
+        const channelsResponse = await fetch('/api/channels?limit=100', {
           headers: {
             'X-API-Key': apiKey || '',
           },
         });
 
-        console.log('[ChatPage] Web channel response status:', response.status);
+        console.log('[ChatPage] Channels response status:', channelsResponse.status);
 
         // Handle 401 unauthorized
-        if (response.status === 401) {
+        if (channelsResponse.status === 401) {
           console.error('[ChatPage] 401 Unauthorized - API key invalid or expired');
           handleUnauthorized();
           return;
         }
 
-        if (!response.ok) {
-          const errorText = await response.text();
-          console.error('[ChatPage] Web channel fetch failed:', response.status, errorText);
-          throw new Error(`HTTP ${response.status}: ${errorText}`);
+        if (!channelsResponse.ok) {
+          const errorText = await channelsResponse.text();
+          console.error('[ChatPage] Channels fetch failed:', channelsResponse.status, errorText);
+          throw new Error(`HTTP ${channelsResponse.status}: ${errorText}`);
         }
 
-        const webChannel: WebChannel = await response.json();
-        console.log('[ChatPage] Web channel data:', webChannel);
+        const channelsData = await channelsResponse.json();
+        const allChannels: WebChannel[] = channelsData.items || [];
 
-        if (webChannel.id && webChannel.is_active) {
-          setChannel(webChannel);
-          console.log('[ChatPage] Channel set, resident_agent_id:', webChannel.resident_agent_id);
-          // Load messages for the channel
-          await loadMessages(webChannel.id);
-        } else if (webChannel.id && !webChannel.is_active) {
-          console.error('[ChatPage] Channel not active');
-          setError('Web 聊天频道未激活');
+        // Filter to only active web channels
+        const webChannels = allChannels.filter(
+          (c: WebChannel) => c.channel_type === 'web' && c.is_active
+        );
+
+        console.log('[ChatPage] Web channels:', webChannels);
+
+        // Fetch agent names for all resident agents
+        const agentIds = [...new Set(webChannels
+          .map((c: WebChannel) => c.resident_agent_id)
+          .filter((id): id is string => id !== null)
+        )];
+
+        const agentNames = new Map<string, { name: string }>();
+        for (const agentId of agentIds) {
+          try {
+            const agentResponse = await fetch(`/api/agents/${agentId}`, {
+              headers: { 'X-API-Key': apiKey || '' },
+            });
+            if (agentResponse.ok) {
+              const agent = await agentResponse.json();
+              agentNames.set(agentId, { name: agent.name || 'Agent' });
+            }
+          } catch (e) {
+            console.error('[ChatPage] Failed to fetch agent:', agentId, e);
+            agentNames.set(agentId, { name: 'Agent' });
+          }
+        }
+        setAgents(agentNames);
+
+        if (webChannels.length > 0) {
+          setChannels(webChannels);
+          setSelectedChannelIndex(0);
+          console.log('[ChatPage] Channels set, first channel resident_agent_id:', webChannels[0].resident_agent_id);
+          // Load messages for the first channel
+          await loadMessages(webChannels[0].id!);
         } else {
-          console.error('[ChatPage] No channel found');
-          // This shouldn't happen if init status was correct, but handle it
+          console.error('[ChatPage] No web channels found');
           setShowInitDialog(true);
         }
       } catch (err) {
-        console.error('[ChatPage] Failed to fetch web channel:', err);
+        console.error('[ChatPage] Failed to fetch channels:', err);
         setError('无法连接到聊天服务，请刷新页面重试');
       }
     };
@@ -629,7 +666,31 @@ export const ChatPage: React.FC = () => {
         <div className="flex items-center justify-between">
           <div className="flex items-center">
             <MessageCircle className="w-5 h-5 text-blue-600 mr-2" />
-            <h2 className="text-lg font-semibold text-gray-900">和老六聊天</h2>
+            {channels.length > 1 ? (
+              <select
+                value={selectedChannelIndex}
+                onChange={(e) => {
+                  const idx = parseInt(e.target.value, 10);
+                  setSelectedChannelIndex(idx);
+                  setMessages([]);
+                  loadMessages(channels[idx].id!);
+                }}
+                className="text-lg font-semibold text-gray-900 bg-transparent border-none focus:outline-none cursor-pointer"
+              >
+                {channels.map((ch, idx) => {
+                  const agentName = ch.resident_agent_id
+                    ? agents.get(ch.resident_agent_id)?.name || 'Agent'
+                    : 'Chat';
+                  return (
+                    <option key={ch.id} value={idx}>
+                      和{agentName}聊天
+                    </option>
+                  );
+                })}
+              </select>
+            ) : (
+              <h2 className="text-lg font-semibold text-gray-900">和{currentAgentName}聊天</h2>
+            )}
           </div>
           <div className="flex items-center space-x-2">
             {isConnected ? (
@@ -709,7 +770,7 @@ export const ChatPage: React.FC = () => {
         {messages.length === 0 && !streamingContent ? (
           <div className="flex flex-col items-center justify-center h-full text-gray-400">
             <MessageCircle className="w-12 h-12 mb-2" />
-            <p>开始和老六聊天吧！</p>
+            <p>开始和{currentAgentName}聊天吧！</p>
           </div>
         ) : (
           <div className="space-y-4">

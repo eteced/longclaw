@@ -107,3 +107,32 @@ class AgentRegistry:
 
 # Global agent registry instance
 agent_registry = AgentRegistry()
+
+
+async def register_and_start_resident_agent(agent_id: str) -> Any | None:
+    """Register and start a resident agent dynamically.
+
+    Args:
+        agent_id: The agent ID to register and start.
+
+    Returns:
+        The started agent instance, or None if not found.
+    """
+    from backend.agents.resident_agent import ResidentAgent
+
+    # Check if already registered
+    if agent_registry.has_agent(agent_id):
+        agent = agent_registry.get_agent(agent_id)
+        logger.info(f"Agent {agent_id} already registered")
+        return agent
+
+    # Create new agent instance
+    agent = ResidentAgent(agent_id=agent_id)
+    await agent.load(agent_id)
+
+    # Register and start
+    agent_registry.register_agent(agent)
+    await agent.start()
+
+    logger.info(f"Dynamically registered and started resident agent: {agent_id}")
+    return agent

@@ -428,7 +428,7 @@ agent_prompts ─── agent (可选，实例级覆盖)
 
 ## 6. 全部 API 接口清单
 
-**认证方式**：所有 API 需要在 Header 中携带 `X-API-Key: longclaw_admin_2026`
+**认证方式**：所有 API 需要在 Header 中携带 `X-API-Key: YOUR_API_KEY`
 
 ### 6.1 Chat API (`/api/chat`)
 
@@ -544,7 +544,7 @@ REDIS_PORT=6379
 REDIS_DB=0
 
 # API 认证
-API_KEY=longclaw_admin_2026
+API_KEY=YOUR_API_KEY
 
 # LLM 配置
 LLM_DEFAULT_PROVIDER=openai
@@ -834,7 +834,7 @@ npm run dev -- --host 0.0.0.0
 ### 9.7 访问服务
 
 - 前端 Dashboard: http://localhost:5173
-- API Key 登录: 使用 `.env` 中的 `API_KEY`（默认 `longclaw_admin_2026`）
+- API Key 登录: 使用 `.env` 中的 `API_KEY`（默认 `YOUR_API_KEY`）
 - API 文档: http://localhost:8001/docs
 
 ### 9.8 数据库重置

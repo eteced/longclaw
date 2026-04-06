@@ -13,7 +13,9 @@ from backend.api.model_config import router as model_config_router
 from backend.api.prompts import router as prompts_router
 from backend.api.system_config import router as system_config_router
 from backend.api.tasks import router as tasks_router
+from backend.api.skills import router as skills_router
 from backend.api.websocket import router as websocket_router
+from backend.api.system import router as system_router
 
 api_router = APIRouter(prefix="/api")
 
@@ -27,6 +29,8 @@ api_router.include_router(agent_settings_router, prefix="/agent-settings", tags=
 api_router.include_router(prompts_router, prefix="/prompts", tags=["prompts"])
 api_router.include_router(system_config_router, prefix="/system-config", tags=["system-config"])
 api_router.include_router(console_router, prefix="/console", tags=["console"])
+api_router.include_router(system_router, prefix="/system", tags=["system"])
+api_router.include_router(skills_router, prefix="/skills", tags=["skills"])
 
 # WebSocket router is registered directly on the app in main.py (at /ws)
 

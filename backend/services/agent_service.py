@@ -279,6 +279,27 @@ class AgentService:
         await session.flush()
         return result.rowcount > 0
 
+    async def delete_agent(self, session: AsyncSession, agent_id: str) -> bool:
+        """Delete an agent from the database.
+
+        Args:
+            session: Database session.
+            agent_id: Agent ID.
+
+        Returns:
+            True if deleted, False otherwise.
+        """
+        result = await session.execute(
+            select(Agent).where(Agent.id == agent_id)
+        )
+        agent = result.scalar_one_or_none()
+        if not agent:
+            return False
+        await session.delete(agent)
+        await session.flush()
+        logger.info(f"Deleted agent {agent_id}")
+        return True
+
 
 # Global agent service instance
 agent_service = AgentService()

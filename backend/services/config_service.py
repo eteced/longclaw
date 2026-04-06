@@ -48,6 +48,15 @@ CONFIG_METADATA: dict[str, dict[str, Any]] = {
         "min_value": 10,
         "max_value": 3600,
     },
+    "worker_waiting_owner_timeout": {
+        "type": "timeout",
+        "category": "timeout",
+        "unlimited_value": -1,
+        "display_name": "Worker 等待 Owner 响应超时",
+        "unit": "秒",
+        "min_value": 10,
+        "max_value": 86400,
+    },
     "llm_request_timeout": {
         "type": "timeout",
         "category": "llm",
@@ -92,6 +101,51 @@ CONFIG_METADATA: dict[str, dict[str, Any]] = {
         "unit": "秒",
         "min_value": 1,
         "max_value": 3600,
+    },
+    "tool_search_timeout": {
+        "type": "timeout",
+        "category": "tool",
+        "unlimited_value": -1,
+        "display_name": "网页搜索超时",
+        "unit": "秒",
+        "min_value": 10,
+        "max_value": 300,
+    },
+    "tool_fetch_timeout": {
+        "type": "timeout",
+        "category": "tool",
+        "unlimited_value": -1,
+        "display_name": "网页抓取超时",
+        "unit": "秒",
+        "min_value": 10,
+        "max_value": 300,
+    },
+    "chrome_max_processes": {
+        "type": "limit",
+        "category": "tool",
+        "unlimited_value": -1,
+        "display_name": "Chrome 进程最大数量",
+        "unit": "个",
+        "min_value": 1,
+        "max_value": 100,
+    },
+    "chrome_cleanup_interval": {
+        "type": "interval",
+        "category": "tool",
+        "unlimited_value": None,
+        "display_name": "Chrome 清理检查间隔",
+        "unit": "秒",
+        "min_value": 10,
+        "max_value": 600,
+    },
+    "chrome_session_max_age": {
+        "type": "timeout",
+        "category": "tool",
+        "unlimited_value": -1,
+        "display_name": "Chrome 孤儿会话判定时间",
+        "unit": "秒",
+        "min_value": 30,
+        "max_value": 600,
     },
     "scheduler_agent_timeout": {
         "type": "timeout",
@@ -201,12 +255,29 @@ CONFIG_METADATA: dict[str, dict[str, Any]] = {
         "display_name": "启用依赖确认",
         "unit": None,
     },
+    "owner_max_iterations": {
+        "type": "integer",
+        "category": "feature",
+        "unlimited_value": -1,
+        "display_name": "Owner最大迭代次数",
+        "unit": "次",
+        "min_value": 1,
+        "max_value": 100,
+    },
     "force_complex_task": {
         "type": "boolean",
         "category": "feature",
         "unlimited_value": None,
         "display_name": "强制复杂任务流程",
         "unit": None,
+    },
+    "resident_always_allocate_slot": {
+        "type": "boolean",
+        "category": "scheduler",
+        "unlimited_value": None,
+        "display_name": "Resident常驻分配Slot",
+        "unit": None,
+        "description": "Resident Agent是否始终占用模型Slot。关闭后，空闲时释放Slot给其他Agent",
     },
     # String configurations
     "command_blacklist": {
@@ -243,7 +314,9 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "agent_max_context_tokens": "8192",
             "context_compact_threshold": "0.8",
             "owner_confirm_dependencies": "true",
+            "owner_max_iterations": "5",
             "force_complex_task": "false",
+            "resident_always_allocate_slot": "true",
         },
     },
     "high_performance": {
@@ -269,7 +342,9 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "agent_max_context_tokens": "32768",
             "context_compact_threshold": "0.9",
             "owner_confirm_dependencies": "true",
+            "owner_max_iterations": "5",
             "force_complex_task": "false",
+            "resident_always_allocate_slot": "true",
         },
     },
     "unlimited": {
@@ -295,7 +370,9 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "agent_max_context_tokens": "-1",
             "context_compact_threshold": "0.95",
             "owner_confirm_dependencies": "true",
+            "owner_max_iterations": "5",
             "force_complex_task": "false",
+            "resident_always_allocate_slot": "true",
         },
     },
     "safe_mode": {
@@ -321,7 +398,9 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "agent_max_context_tokens": "4096",
             "context_compact_threshold": "0.7",
             "owner_confirm_dependencies": "true",
+            "owner_max_iterations": "5",
             "force_complex_task": "false",
+            "resident_always_allocate_slot": "false",
         },
     },
     "debug": {
@@ -348,6 +427,7 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "context_compact_threshold": "0.6",
             "owner_confirm_dependencies": "false",
             "force_complex_task": "true",
+            "resident_always_allocate_slot": "true",
         },
     },
 }
@@ -439,9 +519,54 @@ DEFAULT_CONFIGS: dict[str, dict[str, Any]] = {
         "value": "true",
         "description": "启用OwnerAgent两阶段依赖确认（推荐开启）",
     },
+    "owner_max_iterations": {
+        "value": "3",
+        "description": "OwnerAgent 最大迭代次数，用于任务完成度评估和后续子任务生成",
+    },
     "force_complex_task": {
         "value": "false",
         "description": "强制所有任务走OwnerAgent复杂任务流程（用于测试）",
+    },
+    "worker_waiting_owner_timeout": {
+        "value": "120",
+        "description": "Worker 等待 Owner 响应超时（秒），-1 表示无限制",
+    },
+    "resident_always_allocate_slot": {
+        "value": "true",
+        "description": "Resident Agent是否始终占用模型Slot。关闭后，空闲时释放Slot给其他Agent",
+    },
+    "resident_agent_max_context": {
+        "value": "8192",
+        "description": "Resident Agent 上下文 token 上限",
+    },
+    "owner_agent_max_context": {
+        "value": "4096",
+        "description": "Owner Agent 上下文 token 上限",
+    },
+    "worker_agent_max_context": {
+        "value": "2048",
+        "description": "Worker Agent 上下文 token 上限",
+    },
+    # Browser cleanup configs
+    "chrome_max_processes": {
+        "value": "10",
+        "description": "Chrome 进程最大数量，超过此数量触发自动清理",
+    },
+    "chrome_cleanup_interval": {
+        "value": "60",
+        "description": "Chrome 清理检查间隔（秒）",
+    },
+    "chrome_session_max_age": {
+        "value": "120",
+        "description": "Chrome 孤儿会话判定时间（秒）",
+    },
+    "tool_search_timeout": {
+        "value": "30",
+        "description": "网页搜索超时时间（秒）",
+    },
+    "tool_fetch_timeout": {
+        "value": "30",
+        "description": "网页抓取超时时间（秒）",
     },
 }
 
@@ -797,14 +922,28 @@ class ConfigService:
                     "config_data": profile.config_data,
                 })
 
+        # Get resident agents for export
+        resident_agents_data = {}
+        async with db_manager.session() as session:
+            from backend.models.agent import Agent, AgentType
+            result = await session.execute(
+                select(Agent).where(Agent.agent_type == AgentType.RESIDENT)
+            )
+            for agent in result.scalars().all():
+                resident_agents_data[agent.id] = {
+                    "name": agent.name,
+                    "personality": agent.personality,
+                }
+
         return {
-            "version": "2.0",
+            "version": "2.1",
             "exported_at": datetime.utcnow().isoformat(),
             "unlimited_value": self.UNLIMITED_VALUE,
             "system_configs": configs_dict,
             "agent_settings": agent_settings_data,
             "model_config": model_config_data,
             "profiles": profiles_data,
+            "resident_agents": resident_agents_data,
         }
 
     async def export_config_json(self) -> str:
@@ -834,6 +973,7 @@ class ConfigService:
             "agent_settings": {"imported": 0, "skipped": 0, "errors": []},
             "model_config": {"imported": False, "error": None},
             "profiles": {"imported": 0, "errors": []},
+            "resident_agents": {"imported": 0, "skipped": 0, "errors": []},
         }
 
         # Import system configs (support both old and new format)
@@ -935,6 +1075,32 @@ class ConfigService:
 
                     except Exception as e:
                         result["agent_settings"]["errors"].append(f"{key}: {str(e)}")
+
+                await session.commit()
+
+        # Import resident agents (version 2.1 format)
+        resident_agents_data = data.get("resident_agents", {})
+        if resident_agents_data:
+            async with db_manager.session() as session:
+                from backend.models.agent import Agent
+
+                for agent_id, agent_data in resident_agents_data.items():
+                    try:
+                        existing = await session.execute(
+                            select(Agent).where(Agent.id == agent_id)
+                        )
+                        agent = existing.scalar_one_or_none()
+                        if agent:
+                            if "name" in agent_data:
+                                agent.name = agent_data["name"]
+                            if "personality" in agent_data:
+                                agent.personality = agent_data["personality"]
+                            agent.updated_at = datetime.utcnow()
+                            result["resident_agents"]["imported"] += 1
+                        else:
+                            result["resident_agents"]["skipped"] += 1
+                    except Exception as e:
+                        result["resident_agents"]["errors"].append(f"{agent_id}: {str(e)}")
 
                 await session.commit()
 

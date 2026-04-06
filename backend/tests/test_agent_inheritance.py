@@ -349,3 +349,33 @@ class TestAgentTypeAttributes:
         from backend.models.agent import AgentType
         agent = WorkerAgent()
         assert agent._agent_type == AgentType.WORKER
+
+
+class TestAgentCancellationAttributes:
+    """Test that SubAgent and WorkerAgent have cancellation attributes."""
+
+    def test_sub_agent_has_cancellation_event(self):
+        """SubAgent should have _cancellation_event attribute."""
+        agent = SubAgent()
+        assert hasattr(agent, '_cancellation_event')
+        import asyncio
+        assert isinstance(agent._cancellation_event, asyncio.Event)
+
+    def test_sub_agent_has_cancel_requested_flag(self):
+        """SubAgent should have _cancel_requested flag."""
+        agent = SubAgent()
+        assert hasattr(agent, '_cancel_requested')
+        assert agent._cancel_requested is False
+
+    def test_worker_agent_has_cancellation_event(self):
+        """WorkerAgent should have _cancellation_event attribute (inherited)."""
+        agent = WorkerAgent()
+        assert hasattr(agent, '_cancellation_event')
+        import asyncio
+        assert isinstance(agent._cancellation_event, asyncio.Event)
+
+    def test_worker_agent_has_cancel_requested_flag(self):
+        """WorkerAgent should have _cancel_requested flag (inherited)."""
+        agent = WorkerAgent()
+        assert hasattr(agent, '_cancel_requested')
+        assert agent._cancel_requested is False

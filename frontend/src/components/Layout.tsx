@@ -1,6 +1,6 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { Home, ListTodo, Users, Radio, MessageCircle, Settings, Sliders, Clock, Terminal } from 'lucide-react';
+import { Home, ListTodo, Users, Radio, MessageCircle, Settings, Sliders, Clock, Terminal, BookOpen } from 'lucide-react';
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -15,6 +15,7 @@ const navItems = [
   { path: '/console', label: 'Console', icon: Terminal },
   { path: '/models', label: 'Models', icon: Settings },
   { path: '/agent-settings', label: 'Agent Config', icon: Sliders },
+  { path: '/skills', label: 'Skills', icon: BookOpen },
   { path: '/system', label: 'System', icon: Clock },
 ];
 

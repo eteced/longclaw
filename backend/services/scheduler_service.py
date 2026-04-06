@@ -59,8 +59,49 @@ class SchedulerService:
             return
 
         self._running = True
+
+        # Check for orphaned workers at startup
+        await self._check_startup_orphaned_workers()
+
         self._tasks.append(asyncio.create_task(self._run_loop()))
         logger.info("Scheduler service started")
+
+    async def _check_startup_orphaned_workers(self) -> None:
+        """Check for orphaned workers at startup.
+
+        Finds tasks with owner agents that are terminated/errored/done
+        but workers still running, and terminates those workers.
+        """
+        logger.info("Checking for orphaned workers at startup...")
+        async with db_manager.session() as session:
+            from sqlalchemy import select
+
+            # Find all tasks
+            result = await session.execute(select(Task))
+            tasks = list(result.scalars().all())
+
+            for task in tasks:
+                if not task.owner_agent_id:
+                    continue
+
+                # Check owner agent status
+                owner_result = await session.execute(
+                    select(Agent).where(Agent.id == task.owner_agent_id)
+                )
+                owner = owner_result.scalar_one_or_none()
+
+                if owner and owner.status in (
+                    AgentStatus.TERMINATED,
+                    AgentStatus.ERROR,
+                    AgentStatus.DONE,
+                ):
+                    logger.warning(
+                        f"Startup check: Task {task.id} has owner {owner.id} with status {owner.status.value}, "
+                        f"terminating orphaned workers"
+                    )
+                    await self._terminate_task_workers(session, task.id)
+
+            await session.commit()
 
     async def stop(self) -> None:
         """Stop the scheduler."""
@@ -191,17 +232,53 @@ class SchedulerService:
                     if not owner or owner.status in (
                         AgentStatus.TERMINATED,
                         AgentStatus.ERROR,
+                        AgentStatus.DONE,
                     ):
                         logger.warning(
-                            f"Task {task.id} has no active owner agent, "
-                            f"marking as error"
+                            f"Task {task.id} has no active owner agent (status={owner.status.value if owner else 'None'}), "
+                            f"marking workers as terminated"
                         )
-                        task.status = TaskStatus.ERROR
-                        task.updated_at = datetime.utcnow()
+                        # Mark all workers for this task as TERMINATED
+                        await self._terminate_task_workers(session, task.id)
 
-                        await message_service.publish_task_update(
-                            task.id, TaskStatus.ERROR.value
-                        )
+                        # Also mark task as terminated/error if owner is terminated
+                        if owner and owner.status == AgentStatus.TERMINATED:
+                            task.status = TaskStatus.ERROR
+                            task.updated_at = datetime.utcnow()
+                            await message_service.publish_task_update(
+                                task.id, TaskStatus.ERROR.value
+                            )
+
+    async def _terminate_task_workers(self, session: Any, task_id: str) -> None:
+        """Terminate all workers for a task.
+
+        Args:
+            session: Database session.
+            task_id: Task ID.
+        """
+        from backend.services.agent_service import agent_service
+        from backend.services.agent_registry import agent_registry
+        from sqlalchemy import select
+
+        result = await session.execute(
+            select(Agent).where(
+                Agent.task_id == task_id,
+                Agent.status.in_([AgentStatus.RUNNING, AgentStatus.IDLE]),
+            )
+        )
+        workers = list(result.scalars().all())
+
+        for worker in workers:
+            logger.info(f"Terminating orphaned worker {worker.id} for task {task_id}")
+            # Terminate in memory if registered
+            worker_in_mem = agent_registry.get_agent(worker.id)
+            if worker_in_mem:
+                try:
+                    await worker_in_mem.terminate()
+                except Exception as e:
+                    logger.warning(f"Failed to terminate worker in memory: {e}")
+            # Update DB status
+            await agent_service.terminate_agent(session, worker.id)
 
     async def _run_reflect_check(self) -> None:
         """Run reflect check on all agents.

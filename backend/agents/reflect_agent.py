@@ -35,6 +35,8 @@ class AgentState:
     tool_calls_without_progress: int = 0
     is_stuck: bool = False
     stuck_reason: str | None = None
+    asked_if_complete: bool = False  # Track if we've asked IDLE worker if task is complete
+    responded_done: bool = False  # Track if worker responded with "done/completed"
 
 
 @dataclass
@@ -80,6 +82,7 @@ class ReflectAgent:
                 "如果有问题，请告诉我，我可以帮你调整计划。",
             ],
             "terminate": "检测到 Agent 已无法继续工作，建议终止并向上汇报。",
+            "idle_worker": "请直接回复以下内容之一：\n- 如果任务已完成，回复「完成了」\n- 如果任务未完成，回复「未完成」\n请只回复上述短语，不要包含其他内容。",
         }
 
     async def start(self) -> None:
@@ -121,6 +124,9 @@ class ReflectAgent:
                 analysis = await self._analyze_agent(state)
 
                 if analysis.needs_intervention:
+                    # For idle workers that we asked about completion, mark them as asked
+                    if "asked if task is complete" in (analysis.reason or ""):
+                        state.asked_if_complete = True
                     results.append(analysis)
                     self._agent_states[agent.id] = state
 
@@ -137,6 +143,7 @@ class ReflectAgent:
         """
         # Check if we have previous state
         prev_state = self._agent_states.get(agent.id)
+        asked_if_complete = prev_state.asked_if_complete if prev_state else False
 
         # Get recent messages to check for output
         async with db_manager.session() as session:
@@ -145,11 +152,18 @@ class ReflectAgent:
             )
 
         last_output = None
+        responded_done = False
         if messages:
             # Get the most recent assistant message
             for msg in messages:
                 if msg.sender_type.value == agent.agent_type.value:
                     last_output = msg.content
+                    # Check if worker responded with explicit "完成了" or "未完成"
+                    if asked_if_complete and last_output:
+                        content_stripped = last_output.strip()
+                        # Exact match for completion phrases
+                        responded_done = content_stripped in ("完成了", "完成了。", "完成了！",
+                            "completed", "done", "DONE")
                     break
 
         # Calculate consecutive same outputs
@@ -171,6 +185,8 @@ class ReflectAgent:
             last_output=last_output,
             consecutive_same_outputs=consecutive_same,
             tool_calls_without_progress=prev_state.tool_calls_without_progress if prev_state else 0,
+            asked_if_complete=asked_if_complete,
+            responded_done=responded_done,
         )
 
     async def _analyze_agent(self, state: AgentState) -> ReflectAnalysis:
@@ -184,6 +200,37 @@ class ReflectAgent:
         """
         now = datetime.utcnow()
         time_since_activity = (now - state.last_activity).total_seconds()
+
+        # Special handling for IDLE workers: check if task is complete
+        # Workers that complete normally should be marked DONE, not left IDLE
+        if state.status == "idle" and state.agent_type == "worker":
+            if state.asked_if_complete and state.responded_done:
+                # Worker confirmed completion - mark as DONE
+                return ReflectAnalysis(
+                    agent_id=state.agent_id,
+                    needs_intervention=True,
+                    is_truly_stuck=False,
+                    should_terminate=False,
+                    reason="Worker responded done, marking as DONE",
+                )
+            elif state.asked_if_complete:
+                # We've asked but worker didn't confirm done - just leave it IDLE
+                # Don't keep bothering the worker
+                return ReflectAnalysis(
+                    agent_id=state.agent_id,
+                    needs_intervention=False,
+                    is_truly_stuck=False,
+                )
+            else:
+                # Ask worker if task is complete
+                return ReflectAnalysis(
+                    agent_id=state.agent_id,
+                    needs_intervention=True,
+                    is_truly_stuck=False,
+                    intervention_message=self._get_prompt("idle_worker"),
+                    should_terminate=False,
+                    reason="Worker is IDLE, asking if task is complete",
+                )
 
         # Check if agent is stuck based on time
         # If _stuck_threshold is None (disabled), skip time-based check

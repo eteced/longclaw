@@ -54,6 +54,7 @@ DEFAULT_CONFIGS: dict[str, dict[str, Any]] = {
     "resident_chat_timeout": {"value": "600", "description": "Resident Agent 聊天回复超时（秒），-1 表示无限制"},
     "owner_task_timeout": {"value": "600", "description": "Owner Agent 任务执行总超时（秒），-1 表示无限制"},
     "worker_subtask_timeout": {"value": "180", "description": "Worker/SubAgent 单个子任务超时（秒），-1 表示无限制"},
+    "worker_waiting_owner_timeout": {"value": "120", "description": "Worker 等待 Owner 响应超时（秒），-1 表示无限制"},
     "llm_request_timeout": {"value": "300", "description": "LLM API 请求超时（秒），-1 表示无限制"},
     "llm_connect_timeout": {"value": "30", "description": "LLM API 连接超时（秒），-1 表示无限制"},
     "tool_http_timeout": {"value": "30", "description": "Tool HTTP 请求超时（秒），-1 表示无限制"},
@@ -75,7 +76,18 @@ DEFAULT_CONFIGS: dict[str, dict[str, Any]] = {
     "agent_max_context_tokens": {"value": "8192", "description": "所有Agent的总上下文 token 上限，-1 表示无限制"},
     "context_compact_threshold": {"value": "0.8", "description": "达到上限的比例时触发压缩（0.8 表示 80%）"},
     "owner_confirm_dependencies": {"value": "true", "description": "启用OwnerAgent两阶段依赖确认（推荐开启）"},
+    "owner_max_iterations": {"value": "5", "description": "OwnerAgent最大迭代次数，用于任务完成度评估和后续子任务生成（-1表示不限制，建议5次以上以支持复杂任务）"},
     "force_complex_task": {"value": "false", "description": "强制所有任务走OwnerAgent复杂任务流程（用于测试）"},
+    "resident_always_allocate_slot": {"value": "true", "description": "Resident Agent是否始终占用模型Slot。关闭后，空闲时释放Slot给其他Agent"},
+    "resident_agent_max_context": {"value": "8192", "description": "Resident Agent 上下文 token 上限"},
+    "owner_agent_max_context": {"value": "4096", "description": "Owner Agent 上下文 token 上限"},
+    "worker_agent_max_context": {"value": "2048", "description": "Worker Agent 上下文 token 上限"},
+    # Browser cleanup configs
+    "chrome_max_processes": {"value": "10", "description": "Chrome 进程最大数量，超过此数量触发自动清理"},
+    "chrome_cleanup_interval": {"value": "60", "description": "Chrome 进程检查间隔（秒）"},
+    "chrome_session_max_age": {"value": "120", "description": "Chrome 孤儿会话判定时间（秒），超过此时间的未清理会话被视为孤儿进程"},
+    "tool_search_timeout": {"value": "30", "description": "网页搜索超时时间（秒）"},
+    "tool_fetch_timeout": {"value": "30", "description": "网页抓取超时时间（秒）"},
 }
 
 # ==================== 预设配置方案 ====================
@@ -105,7 +117,17 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "agent_max_context_tokens": "8192",
             "context_compact_threshold": "0.8",
             "owner_confirm_dependencies": "true",
+            "owner_max_iterations": "5",
             "force_complex_task": "false",
+            "resident_always_allocate_slot": "true",
+            "resident_agent_max_context": "8192",
+            "owner_agent_max_context": "4096",
+            "worker_agent_max_context": "2048",
+            "chrome_max_processes": "10",
+            "chrome_cleanup_interval": "60",
+            "chrome_session_max_age": "120",
+            "tool_search_timeout": "30",
+            "tool_fetch_timeout": "30",
         },
     },
     "high_performance": {
@@ -132,7 +154,17 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "agent_max_context_tokens": "32768",
             "context_compact_threshold": "0.9",
             "owner_confirm_dependencies": "true",
+            "owner_max_iterations": "5",
             "force_complex_task": "false",
+            "resident_always_allocate_slot": "true",
+            "resident_agent_max_context": "32768",
+            "owner_agent_max_context": "16384",
+            "worker_agent_max_context": "8192",
+            "chrome_max_processes": "20",
+            "chrome_cleanup_interval": "60",
+            "chrome_session_max_age": "120",
+            "tool_search_timeout": "60",
+            "tool_fetch_timeout": "60",
         },
     },
     "unlimited": {
@@ -159,7 +191,17 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "agent_max_context_tokens": "-1",
             "context_compact_threshold": "0.95",
             "owner_confirm_dependencies": "true",
+            "owner_max_iterations": "5",
             "force_complex_task": "false",
+            "resident_always_allocate_slot": "true",
+            "resident_agent_max_context": "-1",
+            "owner_agent_max_context": "-1",
+            "worker_agent_max_context": "-1",
+            "chrome_max_processes": "50",
+            "chrome_cleanup_interval": "120",
+            "chrome_session_max_age": "300",
+            "tool_search_timeout": "-1",
+            "tool_fetch_timeout": "-1",
         },
     },
     "safe_mode": {
@@ -186,7 +228,17 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "agent_max_context_tokens": "4096",
             "context_compact_threshold": "0.7",
             "owner_confirm_dependencies": "true",
+            "owner_max_iterations": "5",
             "force_complex_task": "false",
+            "resident_always_allocate_slot": "false",
+            "resident_agent_max_context": "4096",
+            "owner_agent_max_context": "2048",
+            "worker_agent_max_context": "1024",
+            "chrome_max_processes": "5",
+            "chrome_cleanup_interval": "30",
+            "chrome_session_max_age": "60",
+            "tool_search_timeout": "15",
+            "tool_fetch_timeout": "15",
         },
     },
     "debug": {
@@ -214,6 +266,15 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
             "context_compact_threshold": "0.6",
             "owner_confirm_dependencies": "false",
             "force_complex_task": "true",
+            "resident_always_allocate_slot": "true",
+            "resident_agent_max_context": "4096",
+            "owner_agent_max_context": "2048",
+            "worker_agent_max_context": "1024",
+            "chrome_max_processes": "10",
+            "chrome_cleanup_interval": "60",
+            "chrome_session_max_age": "120",
+            "tool_search_timeout": "30",
+            "tool_fetch_timeout": "30",
         },
     },
 }
@@ -222,34 +283,73 @@ PRESET_PROFILES: dict[str, dict[str, Any]] = {
 async def clear_all_tables() -> None:
     """Clear all data from tables in correct order (respecting foreign keys)."""
     async with db_manager.session() as session:
-        # 按照外键依赖顺序清空表 (先清空有外键依赖的子表)
-        tables = [
-            "messages",
-            "subtasks",
-            "tasks",
-            "conversations",
-            "knowledge",
-            "agent_settings",
-            "agent_prompts",
-            "agents",
-            "channels",
-            "config_profiles",
-            "system_config",
+        # 必须按正确顺序清空表，否则外键约束会导致失败
+        # 顺序原则：先清子表，再清父表
+
+        # 首先禁用外键检查（如果支持）
+        try:
+            await session.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
+            logger.info("  已禁用外键检查")
+        except Exception:
+            pass
+
+        # 按照依赖顺序清空表
+        # 层级1: messages (无强依赖)
+        # 层级2: subtasks -> tasks, agents
+        # 层级3: model_slots -> agents, tasks, subtasks
+        # 层级4: agents
+        # 层级5: tasks -> agents
+        # 层级6: conversations, knowledge, agent_settings, agent_prompts, channels, config_profiles, system_config
+
+        tables_order = [
+            # 层级1: 无外键依赖的消息表先清
+            ("messages",),
+            # 层级2: subtasks 依赖 tasks 和 agents
+            ("subtasks",),
+            # 层级3: model_slots 依赖多个表
+            ("model_slots",),
+            # 层级4: conversations 依赖 channels 和 agents
+            ("conversations",),
+            # 层级5: tasks 依赖 agents
+            ("tasks",),
+            # 层级6: knowledge 依赖 agents
+            ("knowledge",),
+            # 层级7: agent_settings 和 agent_prompts 依赖 agents
+            ("agent_settings",),
+            ("agent_prompts",),
+            # 层级8: agents (必须在 tasks 之后清，因为 tasks.parent_agent_id 引用 agents)
+            ("agents",),
+            # 层级9: channels 依赖 agents
+            ("channels",),
+            # 层级10: config_profiles 和 system_config (无外键依赖)
+            ("config_profiles",),
+            ("system_config",),
         ]
 
         logger.info("Step 1: 清空所有数据表...")
 
-        for table in tables:
+        for table_info in tables_order:
+            table = table_info[0]
             try:
-                await session.execute(text(f"TRUNCATE TABLE {table}"))
-                logger.info(f"  ✓ 已清空: {table}")
-            except Exception:
+                # 尝试 TRUNCATE（更快）
+                await session.execute(text(f"TRUNCATE TABLE `{table}`"))
+                logger.info(f"  ✓ 已清空: {table} (TRUNCATE)")
+            except Exception as e:
                 try:
-                    await session.execute(text(f"DELETE FROM {table}"))
+                    # 回退到 DELETE
+                    await session.execute(text(f"DELETE FROM `{table}`"))
                     logger.info(f"  ✓ 已清空: {table} (DELETE)")
-                except Exception as e:
-                    logger.warning(f"  - 跳过: {table} ({e})")
+                except Exception as e2:
+                    logger.warning(f"  - 清空失败: {table} ({e2})")
 
+        # 重新启用外键检查
+        try:
+            await session.execute(text("SET FOREIGN_KEY_CHECKS = 1"))
+            logger.info("  已重新启用外键检查")
+        except Exception:
+            pass
+
+        await session.commit()
         logger.info("  所有表已清空")
 
 

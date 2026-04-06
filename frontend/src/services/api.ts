@@ -39,6 +39,12 @@ import type {
   ConfigImport,
   ConfigImportResult,
   ProfileLoadResult,
+  Skill,
+  SkillListResponse,
+  SkillCreate,
+  SkillUpdate,
+  CategoryListResponse,
+  SkillSearchResponse,
 } from '../types';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
@@ -180,6 +186,42 @@ class ApiService {
     return response.data;
   }
 
+  async createAgent(data: {
+    name: string;
+    personality?: string;
+    system_prompt?: string;
+    provider_name?: string;
+    model_name?: string;
+    max_context_tokens?: number;
+  }): Promise<Agent> {
+    const response = await this.client.post<Agent>('/agents', data);
+    return response.data;
+  }
+
+  async updateAgent(agentId: string, data: {
+    name?: string;
+    personality?: string;
+    system_prompt?: string;
+  }): Promise<Agent> {
+    const response = await this.client.patch<Agent>(`/agents/${agentId}`, data);
+    return response.data;
+  }
+
+  async terminateAgent(agentId: string): Promise<Agent> {
+    const response = await this.client.post<Agent>(`/agents/${agentId}/terminate`);
+    return response.data;
+  }
+
+  async startAgent(agentId: string): Promise<Agent> {
+    const response = await this.client.post<Agent>(`/agents/${agentId}/start`);
+    return response.data;
+  }
+
+  async deleteAgent(agentId: string): Promise<{ deleted: boolean; agent_id: string }> {
+    const response = await this.client.delete<{ deleted: boolean; agent_id: string }>(`/agents/${agentId}`);
+    return response.data;
+  }
+
   // ==================== Channels ====================
 
   async getChannels(params?: {
@@ -295,16 +337,71 @@ class ApiService {
     return response.data;
   }
 
-  async setModelServiceMode(provider: string, model: string, serviceMode: 'parallel' | 'serial'): Promise<ModelInfoResponse> {
-    const response = await this.client.put<ModelInfoResponse>(
-      `/model-config/models/${provider}/${model}/service-mode`,
-      { service_mode: serviceMode }
+  async setProviderMaxParallel(provider: string, maxParallel: number): Promise<{ provider: string; max_parallel_requests: number }> {
+    const response = await this.client.put<{ provider: string; max_parallel_requests: number }>(
+      `/model-config/providers/${provider}/max-parallel`,
+      { max_parallel_requests: maxParallel }
     );
     return response.data;
   }
 
   async getAllContextLimits(): Promise<Record<string, number>> {
     const response = await this.client.get<Record<string, number>>('/model-config/context-limits');
+    return response.data;
+  }
+
+  // ==================== Provider Scheduler ====================
+
+  async getSchedulerStatus(): Promise<{
+    total_active: number;
+    by_provider: Record<string, unknown[]>;
+    allocations: unknown[];
+    provider_config: {
+      total_max: Record<string, number>;
+      model_max: Record<string, Record<string, number>>;
+    };
+  }> {
+    const response = await this.client.get('/model-config/scheduler/status');
+    return response.data;
+  }
+
+  async getSchedulerSummary(): Promise<{
+    total_allocated: number;
+    by_provider: Array<{
+      provider_name: string;
+      allocated: number;
+      max: number;
+      models: Array<{
+        model_name: string;
+        allocated: number;
+        max: number;
+        slots: Array<{
+          slot_index: number;
+          agent_id: string;
+          agent_name: string;
+          operation: string;
+          priority: number;
+        }>;
+      }>;
+    }>;
+  }> {
+    const response = await this.client.get('/model-config/scheduler/summary');
+    return response.data;
+  }
+
+  async getAgentAllocation(agentId: string): Promise<{
+    slot_id: string | null;
+    agent_id: string;
+    provider_name: string | null;
+    model_name: string | null;
+    priority: number;
+    priority_reason: string | null;
+    operation_type: string | null;
+    is_allocated: boolean;
+    allocated_at: string | null;
+    slot_index: number;
+  }> {
+    const response = await this.client.get(`/model-config/scheduler/agent/${agentId}`);
     return response.data;
   }
 
@@ -479,6 +576,63 @@ class ApiService {
   async saveCurrentToProfile(profileId: string): Promise<ConfigProfile> {
     const response = await this.client.post<ConfigProfile>(`/system-config/profiles/${profileId}/save`);
     return response.data;
+  }
+
+  // ==================== System Control ====================
+
+  async restartBackend(): Promise<{ status: string; message: string }> {
+    const response = await this.client.post<{ status: string; message: string }>('/system/restart');
+    return response.data;
+  }
+
+  async getSystemStatus(): Promise<{
+    python_version: string;
+    pid: number;
+    uvicorn_pids?: string[];
+    uvicorn_running: boolean;
+  }> {
+    const response = await this.client.get('/system/status');
+    return response.data;
+  }
+
+  // ==================== Skills ====================
+
+  async getSkills(category?: string): Promise<SkillListResponse> {
+    const response = await this.client.get<SkillListResponse>('/skills', {
+      params: category ? { category } : undefined,
+    });
+    return response.data;
+  }
+
+  async getSkill(skillName: string): Promise<Skill> {
+    const response = await this.client.get<Skill>(`/skills/${skillName}`);
+    return response.data;
+  }
+
+  async searchSkills(query: string): Promise<SkillSearchResponse> {
+    const response = await this.client.get<SkillSearchResponse>('/skills/search', {
+      params: { q: query },
+    });
+    return response.data;
+  }
+
+  async getCategories(): Promise<CategoryListResponse> {
+    const response = await this.client.get<CategoryListResponse>('/skills/categories');
+    return response.data;
+  }
+
+  async createSkill(data: SkillCreate): Promise<Skill> {
+    const response = await this.client.post<Skill>('/skills', data);
+    return response.data;
+  }
+
+  async updateSkill(skillName: string, data: SkillUpdate): Promise<Skill> {
+    const response = await this.client.put<Skill>(`/skills/${skillName}`, data);
+    return response.data;
+  }
+
+  async deleteSkill(skillName: string): Promise<void> {
+    await this.client.delete(`/skills/${skillName}`);
   }
 }
 

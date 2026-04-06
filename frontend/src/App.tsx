@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { Layout } from './components';
-import { HomePage, TasksPage, TaskDetailPage, AgentsPage, ChannelsPage, LoginPage, ChatPage, ModelConfigPage, AgentSettingsPage, SystemConfigPage, ConsolePage } from './pages';
+import { HomePage, TasksPage, TaskDetailPage, AgentsPage, ChannelsPage, LoginPage, ChatPage, ModelConfigPage, AgentSettingsPage, SystemConfigPage, ConsolePage, SkillsPage } from './pages';
 import { api } from './services/api';
 
 function App() {
@@ -70,6 +70,7 @@ function App() {
           <Route path="/system" element={<SystemConfigPage />} />
           <Route path="/chat" element={<ChatPage />} />
           <Route path="/console" element={<ConsolePage />} />
+          <Route path="/skills" element={<SkillsPage />} />
         </Routes>
       </Layout>
     </BrowserRouter>

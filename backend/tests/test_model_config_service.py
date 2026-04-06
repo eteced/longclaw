@@ -118,8 +118,8 @@ class TestModelConfigServiceExtensions:
         assert result is False
 
     @pytest.mark.asyncio
-    async def test_get_provider_service_mode(self):
-        """Test getting service mode for a specific provider."""
+    async def test_get_provider_max_parallel(self):
+        """Test getting max parallel requests for a specific provider."""
         mock_session = AsyncMock()
 
         # Mock the config query
@@ -128,7 +128,7 @@ class TestModelConfigServiceExtensions:
         mock_config.providers = [
             {
                 "name": "deepseek",
-                "service_mode": "serial",
+                "max_parallel_requests": 5,
                 "models": [
                     {"name": "deepseek-chat", "max_context_tokens": 64000},
                 ]
@@ -137,17 +137,17 @@ class TestModelConfigServiceExtensions:
         mock_result.scalar_one_or_none.return_value = mock_config
         mock_session.execute.return_value = mock_result
 
-        # Call get_provider_service_mode
-        mode = await model_config_service.get_provider_service_mode(
+        # Call get_provider_max_parallel
+        max_parallel = await model_config_service.get_provider_max_parallel(
             mock_session, "deepseek"
         )
 
-        # Should return the configured service mode
-        assert mode == "serial"
+        # Should return the configured max parallel
+        assert max_parallel == 5
 
     @pytest.mark.asyncio
-    async def test_get_provider_service_mode_default(self):
-        """Test getting service mode when not configured (defaults to 'parallel')."""
+    async def test_get_provider_max_parallel_default(self):
+        """Test getting max parallel when not configured (defaults to 10)."""
         mock_session = AsyncMock()
 
         # Mock the config query
@@ -164,17 +164,17 @@ class TestModelConfigServiceExtensions:
         mock_result.scalar_one_or_none.return_value = mock_config
         mock_session.execute.return_value = mock_result
 
-        # Call get_provider_service_mode
-        mode = await model_config_service.get_provider_service_mode(
+        # Call get_provider_max_parallel
+        max_parallel = await model_config_service.get_provider_max_parallel(
             mock_session, "openai"
         )
 
-        # Should return default 'parallel'
-        assert mode == "parallel"
+        # Should return default 10
+        assert max_parallel == 10
 
     @pytest.mark.asyncio
-    async def test_set_provider_service_mode(self):
-        """Test setting service mode for a specific provider."""
+    async def test_set_provider_max_parallel(self):
+        """Test setting max parallel requests for a specific provider."""
         mock_session = AsyncMock()
 
         # Mock the config query and update
@@ -183,7 +183,7 @@ class TestModelConfigServiceExtensions:
         mock_config.providers = [
             {
                 "name": "deepseek",
-                "service_mode": "parallel",
+                "max_parallel_requests": 10,
                 "models": [
                     {"name": "deepseek-chat", "max_context_tokens": 64000},
                 ]
@@ -193,23 +193,23 @@ class TestModelConfigServiceExtensions:
         mock_session.execute.return_value = mock_result
         mock_session.flush = AsyncMock()
 
-        # Call set_provider_service_mode
-        result = await model_config_service.set_provider_service_mode(
-            mock_session, "deepseek", "serial"
+        # Call set_provider_max_parallel
+        result = await model_config_service.set_provider_max_parallel(
+            mock_session, "deepseek", 5
         )
 
         # Should return True indicating success
         assert result is True
 
     @pytest.mark.asyncio
-    async def test_set_provider_service_mode_invalid(self):
-        """Test setting invalid service mode raises error."""
+    async def test_set_provider_max_parallel_invalid(self):
+        """Test setting invalid max parallel raises error."""
         mock_session = AsyncMock()
 
-        # Call set_provider_service_mode with invalid mode
-        with pytest.raises(ValueError, match="Invalid service mode"):
-            await model_config_service.set_provider_service_mode(
-                mock_session, "openai", "invalid_mode"
+        # Call set_provider_max_parallel with invalid value
+        with pytest.raises(ValueError, match="Invalid max_parallel"):
+            await model_config_service.set_provider_max_parallel(
+                mock_session, "openai", 0
             )
 
     @pytest.mark.asyncio

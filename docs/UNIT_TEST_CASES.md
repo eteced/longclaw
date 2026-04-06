@@ -116,7 +116,7 @@ python backend/tests/test_agent_pipeline.py
 
 ```bash
 API="http://localhost:8001"
-KEY="longclaw_admin_2026"
+KEY="YOUR_API_KEY"
 TASK_ID="<从响应中获取>"
 
 # 1. 等待任务创建

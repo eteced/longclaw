@@ -1,0 +1,85 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: longclaw-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: longclaw_root
+      MYSQL_DATABASE: longclaw
+      MYSQL_USER: longclaw
+      MYSQL_PASSWORD: longclaw123
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: longclaw-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: longclaw-backend
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_NAME=longclaw
+      - DB_USER=longclaw
+      - DB_PASSWORD=longclaw123
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - API_KEY=YOUR_API_KEY
+      - LLM_DEFAULT_PROVIDER=openai
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.frontend
+    container_name: longclaw-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=
+
+volumes:
+  mysql_data:
+  redis_data:

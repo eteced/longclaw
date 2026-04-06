@@ -53,10 +53,17 @@ export const SystemConfigPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [editedConfigs, setEditedConfigs] = useState<EditedConfig>({});
-  const [activeTab, setActiveTab] = useState<'configs' | 'profiles'>('configs');
+  const [activeTab, setActiveTab] = useState<'configs' | 'profiles' | 'control'>('configs');
   const [showNewProfile, setShowNewProfile] = useState(false);
   const [newProfileName, setNewProfileName] = useState('');
   const [newProfileDesc, setNewProfileDesc] = useState('');
+  const [systemStatus, setSystemStatus] = useState<{
+    python_version: string;
+    pid: number;
+    uvicorn_pids?: string[];
+    uvicorn_running: boolean;
+  } | null>(null);
+  const [isRestarting, setIsRestarting] = useState(false);
 
   useEffect(() => {
     fetchData();
@@ -362,6 +369,58 @@ export const SystemConfigPage: React.FC = () => {
     return categories?.metadata?.[key]?.category || 'Other';
   };
 
+  const fetchSystemStatus = async () => {
+    try {
+      const status = await api.getSystemStatus();
+      setSystemStatus(status);
+    } catch (err) {
+      console.error('Failed to fetch system status:', err);
+    }
+  };
+
+  const handleRestartBackend = async () => {
+    if (!confirm('Restart the backend server? This will temporarily interrupt service.')) {
+      return;
+    }
+
+    try {
+      setIsRestarting(true);
+      await api.restartBackend();
+      showMessage('Backend restart initiated. The page will refresh in a few seconds.');
+
+      // Poll for backend to come back up
+      let retries = 0;
+      const pollInterval = setInterval(async () => {
+        retries++;
+        try {
+          const status = await api.getSystemStatus();
+          if (status.uvicorn_running) {
+            clearInterval(pollInterval);
+            showMessage('Backend restarted successfully!');
+            await fetchSystemStatus();
+            setIsRestarting(false);
+          }
+        } catch {
+          if (retries > 30) {
+            clearInterval(pollInterval);
+            showMessage('Backend restart timed out. Please refresh the page.', true);
+            setIsRestarting(false);
+          }
+        }
+      }, 2000);
+    } catch (err) {
+      showMessage(err instanceof Error ? err.message : 'Failed to restart backend', true);
+      setIsRestarting(false);
+    }
+  };
+
+  // Fetch system status when control tab is active
+  useEffect(() => {
+    if (activeTab === 'control') {
+      fetchSystemStatus();
+    }
+  }, [activeTab]);
+
   const isUnlimitedSupported = (key: string): boolean => {
     return categories?.metadata?.[key]?.unlimited_value !== null &&
            categories?.metadata?.[key]?.unlimited_value !== undefined;
@@ -471,6 +530,19 @@ export const SystemConfigPage: React.FC = () => {
             <div className="flex items-center gap-2">
               <Layers className="w-4 h-4" />
               Profiles
+            </div>
+          </button>
+          <button
+            onClick={() => setActiveTab('control')}
+            className={`py-4 px-1 border-b-2 font-medium text-sm ${
+              activeTab === 'control'
+                ? 'border-blue-500 text-blue-600'
+                : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              <Zap className="w-4 h-4" />
+              System Control
             </div>
           </button>
         </nav>
@@ -778,6 +850,95 @@ export const SystemConfigPage: React.FC = () => {
                   </div>
                 ))
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'control' && (
+        <div className="space-y-6">
+          {/* System Status */}
+          <div className="bg-white rounded-lg shadow p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-medium text-gray-900">Backend Server Status</h3>
+              <button
+                onClick={fetchSystemStatus}
+                className="flex items-center gap-2 px-3 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200"
+              >
+                <RefreshCw className="w-4 h-4" />
+                Refresh
+              </button>
+            </div>
+
+            {systemStatus ? (
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="bg-gray-50 rounded-lg p-4">
+                    <p className="text-sm text-gray-500">Python Version</p>
+                    <p className="font-medium text-gray-900">{systemStatus.python_version.split(' ')[0]}</p>
+                  </div>
+                  <div className="bg-gray-50 rounded-lg p-4">
+                    <p className="text-sm text-gray-500">Process ID</p>
+                    <p className="font-medium text-gray-900">{systemStatus.pid}</p>
+                  </div>
+                  <div className="bg-gray-50 rounded-lg p-4">
+                    <p className="text-sm text-gray-500">Uvicorn PIDs</p>
+                    <p className="font-medium text-gray-900">
+                      {systemStatus.uvicorn_pids?.join(', ') || 'N/A'}
+                    </p>
+                  </div>
+                  <div className="bg-gray-50 rounded-lg p-4">
+                    <p className="text-sm text-gray-500">Status</p>
+                    <p className={`font-medium ${systemStatus.uvicorn_running ? 'text-green-600' : 'text-red-600'}`}>
+                      {systemStatus.uvicorn_running ? 'Running' : 'Stopped'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <p className="text-gray-500">Loading system status...</p>
+            )}
+          </div>
+
+          {/* Restart Controls */}
+          <div className="bg-white rounded-lg shadow p-6">
+            <h3 className="text-lg font-medium text-gray-900 mb-4">Service Controls</h3>
+            <div className="space-y-4">
+              <div className="border border-gray-200 rounded-lg p-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h4 className="font-medium text-gray-900">Backend Server (Python/Uvicorn)</h4>
+                    <p className="text-sm text-gray-500 mt-1">
+                      Restart the Python backend server. This will temporarily interrupt all API requests and WebSocket connections.
+                    </p>
+                  </div>
+                  <button
+                    onClick={handleRestartBackend}
+                    disabled={isRestarting}
+                    className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium ${
+                      isRestarting
+                        ? 'bg-orange-100 text-orange-600 cursor-wait'
+                        : 'bg-orange-600 text-white hover:bg-orange-700'
+                    }`}
+                  >
+                    <Zap className="w-4 h-4" />
+                    {isRestarting ? 'Restarting...' : 'Restart Backend'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="border border-red-200 bg-red-50 rounded-lg p-4">
+                <div className="flex items-start gap-3">
+                  <AlertCircle className="w-5 h-5 text-red-500 mt-0.5" />
+                  <div>
+                    <h4 className="font-medium text-red-700">Warning</h4>
+                    <p className="text-sm text-red-600 mt-1">
+                      Restarting services will cause temporary disruption. Active tasks may be interrupted.
+                      Only restart when necessary.
+                    </p>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>

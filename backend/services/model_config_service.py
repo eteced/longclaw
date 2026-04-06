@@ -47,6 +47,7 @@ def _get_default_providers() -> list[dict[str, Any]]:
         return {
             "name": model_name,
             "max_context_tokens": DEFAULT_MODEL_CONTEXT_LIMITS.get(model_name, 8192),
+            "max_parallel_requests": 10,  # Default max parallel requests per model
         }
 
     return [
@@ -55,7 +56,7 @@ def _get_default_providers() -> list[dict[str, Any]]:
             "display_name": "OpenAI",
             "base_url": settings.openai_base_url,
             "api_key": settings.openai_api_key,
-            "service_mode": "parallel",  # Provider-level mode
+            "max_parallel_requests": 10,  # Provider-level max parallel requests
             "models": [
                 make_model_info(settings.openai_model),
                 make_model_info("gpt-4o-mini"),
@@ -68,7 +69,7 @@ def _get_default_providers() -> list[dict[str, Any]]:
             "display_name": "DeepSeek",
             "base_url": settings.deepseek_base_url,
             "api_key": settings.deepseek_api_key,
-            "service_mode": "parallel",  # Provider-level mode
+            "max_parallel_requests": 10,  # Provider-level max parallel requests
             "models": [
                 make_model_info(settings.deepseek_model),
                 make_model_info("deepseek-coder"),
@@ -247,6 +248,24 @@ class ModelConfigService:
             return model_info.get("max_context_tokens", 8192)
         return DEFAULT_MODEL_CONTEXT_LIMITS.get(model_name, 8192)
 
+    async def get_model_max_parallel(
+        self, session: AsyncSession, provider_name: str, model_name: str
+    ) -> int:
+        """Get the max parallel requests for a specific model.
+
+        Args:
+            session: Database session.
+            provider_name: Provider name.
+            model_name: Model name.
+
+        Returns:
+            Max parallel requests (default 10 if not found).
+        """
+        model_info = await self.get_model_info(session, provider_name, model_name)
+        if model_info:
+            return model_info.get("max_parallel_requests", 10)
+        return 10
+
     async def set_model_context_limit(
         self, session: AsyncSession, provider_name: str, model_name: str, limit: int
     ) -> bool:
@@ -289,49 +308,49 @@ class ModelConfigService:
 
         return False
 
-    async def get_provider_service_mode(
+    async def get_provider_max_parallel(
         self, session: AsyncSession, provider_name: str
-    ) -> str:
-        """Get the service mode for a specific provider.
+    ) -> int:
+        """Get the max parallel requests for a specific provider.
 
         Args:
             session: Database session.
             provider_name: Provider name.
 
         Returns:
-            Service mode ("parallel" or "serial", default "parallel").
+            Max parallel requests (default 10).
         """
         provider = await self.get_provider_config(session, provider_name)
         if provider:
-            return provider.get("service_mode", "parallel")
-        return "parallel"
+            return provider.get("max_parallel_requests", 10)
+        return 10
 
-    async def set_provider_service_mode(
-        self, session: AsyncSession, provider_name: str, mode: str
+    async def set_provider_max_parallel(
+        self, session: AsyncSession, provider_name: str, max_parallel: int
     ) -> bool:
-        """Set the service mode for a specific provider.
+        """Set the max parallel requests for a specific provider.
 
         Args:
             session: Database session.
             provider_name: Provider name.
-            mode: Service mode ("parallel" or "serial").
+            max_parallel: Max parallel requests.
 
         Returns:
             True if updated, False if provider not found.
         """
-        if mode not in ("parallel", "serial"):
-            raise ValueError(f"Invalid service mode: {mode}. Must be 'parallel' or 'serial'.")
+        if max_parallel < 1:
+            raise ValueError(f"Invalid max_parallel: {max_parallel}. Must be >= 1.")
 
         config = await self.get_config(session)
         providers = list(config.providers)  # Create a copy
 
         for i, provider in enumerate(providers):
             if provider.get("name") == provider_name:
-                providers[i] = {**provider, "service_mode": mode}
+                providers[i] = {**provider, "max_parallel_requests": max_parallel}
                 config.providers = providers
                 config.updated_at = datetime.utcnow()
                 await session.flush()
-                logger.info(f"Set service mode for provider {provider_name}: {mode}")
+                logger.info(f"Set max parallel requests for provider {provider_name}: {max_parallel}")
                 return True
 
         return False

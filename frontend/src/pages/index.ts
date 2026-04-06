@@ -9,3 +9,4 @@ export { ModelConfigPage } from './ModelConfigPage';
 export { AgentSettingsPage } from './AgentSettingsPage';
 export { SystemConfigPage } from './SystemConfigPage';
 export { ConsolePage } from './ConsolePage';
+export { SkillsPage } from './SkillsPage';

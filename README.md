@@ -1,5 +1,26 @@
 # LongClaw - Multi-Agent Task Server
 
+> ⚠️ **Security Warning** ⚠️
+>
+> **LongClaw is NOT designed for direct internet exposure.** It has known security limitations:
+> - No built-in rate limiting
+> - No IP whitelist/blacklist
+> - Simple API key authentication only
+> - Agent code execution capabilities
+>
+> **Deployment Requirements:**
+> - **DO NOT** deploy directly on personal computers with public IP
+> - **DO NOT** expose to the public internet without additional security layers
+> - **ONLY** deploy in isolated environments:
+>   - Internal virtual machines
+>   - Docker containers with network isolation
+>   - Hardware isolated networks (e.g., home lab, internal servers)
+>   - Behind a proper API gateway with authentication
+>
+> If you need public access, use a VPN or reverse proxy with proper authentication.
+
+---
+
 A multi-agent task management system inspired by OpenClaw, focused on task-driven multi-agent collaboration.
 
 ## Architecture
@@ -260,4 +281,4 @@ DEEPSEEK_MODEL=deepseek-chat
 
 ## License
 
-Modified MIT
+MIT

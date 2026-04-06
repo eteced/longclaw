@@ -22,7 +22,7 @@ class ModelInfo(BaseModel):
 
     name: str
     max_context_tokens: int = 8192
-    service_mode: Literal["parallel", "serial"] = "parallel"
+    max_parallel_requests: int = 10  # Max concurrent requests for this model
 
 
 class ProviderConfig(BaseModel):
@@ -32,7 +32,7 @@ class ProviderConfig(BaseModel):
     display_name: str | None = None
     base_url: str
     api_key: str | None = None
-    service_mode: Literal["parallel", "serial"] = "parallel"
+    max_parallel_requests: int = 10  # Provider-level max parallel requests
     models: list[ModelInfo] = Field(default_factory=list)
 
 
@@ -90,7 +90,7 @@ class ModelInfoResponse(BaseModel):
     provider: str
     model: str
     max_context_tokens: int
-    service_mode: str
+    max_parallel_requests: int
 
 
 # ==================== Dependency ====================
@@ -199,7 +199,7 @@ async def get_model_info(
         provider=provider,
         model=model,
         max_context_tokens=model_info.get("max_context_tokens", 8192),
-        service_mode=model_info.get("service_mode", "parallel"),
+        max_parallel_requests=model_info.get("max_parallel_requests", 10),
     )
 
 
@@ -231,33 +231,39 @@ async def set_model_context_limit(
         provider=provider,
         model=model,
         max_context_tokens=data.max_context_tokens,
-        service_mode=await model_config_service.get_model_service_mode(session, provider, model),
+        max_parallel_requests=await model_config_service.get_model_max_parallel(session, provider, model),
     )
 
 
-@router.put("/providers/{provider}/service-mode")
-async def set_provider_service_mode(
+class MaxParallelUpdate(BaseModel):
+    """Schema for updating max parallel requests."""
+
+    max_parallel_requests: int = Field(..., ge=1, le=100)
+
+
+@router.put("/providers/{provider}/max-parallel")
+async def set_provider_max_parallel(
     provider: str,
-    data: ServiceModeUpdate,
+    data: MaxParallelUpdate,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    """Set the service mode for a specific provider.
+    """Set the max parallel requests for a specific provider.
 
     Args:
         provider: Provider name.
-        data: Service mode data.
+        data: Max parallel data.
         session: Database session.
 
     Returns:
         Updated provider information.
     """
-    success = await model_config_service.set_provider_service_mode(
-        session, provider, data.service_mode
+    success = await model_config_service.set_provider_max_parallel(
+        session, provider, data.max_parallel_requests
     )
     if not success:
         raise HTTPException(status_code=404, detail=f"Provider not found: {provider}")
 
-    return {"provider": provider, "service_mode": data.service_mode}
+    return {"provider": provider, "max_parallel_requests": data.max_parallel_requests}
 
 
 @router.get("/context-limits")
@@ -376,6 +382,7 @@ async def test_llm_speed(
         # Measure connection and prefill time (time to first token)
         start_time = time.time()
         first_token_time = None
+        prefill_time_ms: float | None = None
         tokens_generated = 0
         content = ""
 
@@ -517,3 +524,162 @@ async def test_provider_connection(
         latency_ms=result.get("latency_ms"),
         error=result.get("error"),
     )
+
+
+# ==================== Provider Scheduler Endpoints ====================
+
+
+class SchedulerStatusResponse(BaseModel):
+    """Schema for scheduler status response."""
+
+    total_active: int
+    by_provider: dict[str, Any]
+    allocations: list[dict[str, Any]]
+    provider_config: dict[str, Any]
+
+
+class AgentAllocationResponse(BaseModel):
+    """Schema for agent allocation response."""
+
+    slot_id: str | None = None
+    agent_id: str
+    provider_name: str | None = None
+    model_name: str | None = None
+    priority: int = 0
+    priority_reason: str | None = None
+    operation_type: str | None = None
+    is_allocated: bool = False
+    allocated_at: str | None = None
+    slot_index: int = 0
+
+
+@router.get("/scheduler/status", response_model=SchedulerStatusResponse)
+async def get_scheduler_status() -> SchedulerStatusResponse:
+    """Get current provider scheduler status.
+
+    Returns the current allocation status including:
+    - Number of active slots
+    - Slots grouped by provider
+    - Detailed allocation info
+    - Provider configuration (max parallel settings)
+
+    Returns:
+        Scheduler status information.
+    """
+    from backend.services.provider_scheduler_service import provider_scheduler_service
+
+    status = await provider_scheduler_service.get_allocation_status()
+    return SchedulerStatusResponse(
+        total_active=status.get("total_active", 0),
+        by_provider=status.get("by_provider", {}),
+        allocations=status.get("allocations", []),
+        provider_config=status.get("provider_config", {}),
+    )
+
+
+@router.get("/scheduler/agent/{agent_id}", response_model=AgentAllocationResponse)
+async def get_agent_allocation(
+    agent_id: str,
+) -> AgentAllocationResponse:
+    """Get allocation status for a specific agent.
+
+    Args:
+        agent_id: The agent ID to check.
+
+    Returns:
+        Agent's current allocation status.
+    """
+    from backend.services.provider_scheduler_service import provider_scheduler_service
+
+    allocation = await provider_scheduler_service.get_agent_allocation(agent_id)
+
+    if allocation:
+        return AgentAllocationResponse(
+            slot_id=allocation.get("id"),
+            agent_id=agent_id,
+            provider_name=allocation.get("provider_name"),
+            model_name=allocation.get("model_name"),
+            priority=allocation.get("priority", 0),
+            priority_reason=allocation.get("priority_reason"),
+            operation_type=allocation.get("operation_type"),
+            is_allocated=True,
+            allocated_at=allocation.get("allocated_at"),
+            slot_index=allocation.get("slot_index", 0),
+        )
+
+    return AgentAllocationResponse(agent_id=agent_id, is_allocated=False)
+
+
+@router.get("/scheduler/summary")
+async def get_scheduler_summary() -> dict[str, Any]:
+    """Get a summary of provider slot usage for display.
+
+    This endpoint returns a simplified view of slot usage
+    suitable for display in the frontend Model Config page.
+
+    Returns:
+        Summary of slot usage by provider and model.
+    """
+    from backend.services.provider_scheduler_service import provider_scheduler_service
+    from backend.database import db_manager
+    from sqlalchemy import select, func
+    from backend.models.agent import Agent
+
+    status = await provider_scheduler_service.get_allocation_status()
+
+    # Get all agents for context
+    async with db_manager.session() as session:
+        agent_result = await session.execute(
+            select(Agent.id, Agent.name, Agent.agent_type, Agent.status)
+        )
+        agents = {row[0]: {"name": row[1], "type": row[2].value, "status": row[3].value}
+                  for row in agent_result.all()}
+
+    # Build summary by provider
+    summary = {
+        "total_allocated": status.get("total_active", 0),
+        "by_provider": [],
+    }
+
+    provider_config = status.get("provider_config", {})
+    total_max = provider_config.get("total_max", {})
+    model_max = provider_config.get("model_max", {})
+
+    for provider_name, allocations in status.get("by_provider", {}).items():
+        provider_max = total_max.get(provider_name, 10)
+        model_limits = model_max.get(provider_name, {})
+
+        # Group by model
+        by_model: dict[str, list[dict]] = {}
+        for alloc in allocations:
+            model = alloc.get("model", "default")
+            if model not in by_model:
+                by_model[model] = []
+            agent_info = agents.get(alloc.get("agent_id"), {})
+            by_model[model].append({
+                "slot_index": alloc.get("slot_index"),
+                "agent_id": alloc.get("agent_id"),
+                "agent_name": agent_info.get("name", "Unknown"),
+                "operation": alloc.get("operation"),
+                "priority": alloc.get("priority"),
+            })
+
+        # Build model summaries
+        model_summaries = []
+        for model_name, slots in by_model.items():
+            model_limit = model_limits.get(model_name, provider_max)
+            model_summaries.append({
+                "model_name": model_name,
+                "allocated": len(slots),
+                "max": model_limit,
+                "slots": slots,
+            })
+
+        summary["by_provider"].append({
+            "provider_name": provider_name,
+            "allocated": len(allocations),
+            "max": provider_max,
+            "models": model_summaries,
+        })
+
+    return summary

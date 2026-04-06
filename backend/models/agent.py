@@ -26,8 +26,10 @@ class AgentStatus(str, enum.Enum):
     IDLE = "idle"
     RUNNING = "running"
     PAUSED = "paused"
-    TERMINATED = "terminated"
-    ERROR = "error"
+    WAITING = "waiting"  # Worker waiting for OwnerAgent response
+    DONE = "done"  # Agent completed its task normally
+    TERMINATED = "terminated"  # Agent was terminated by user or system
+    ERROR = "error"  # Agent encountered an error
 
 
 class Agent(Base):

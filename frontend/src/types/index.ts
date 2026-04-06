@@ -61,6 +61,13 @@ export interface Subtask {
 export type AgentType = 'resident' | 'owner' | 'worker' | 'sub';
 export type AgentStatus = 'idle' | 'running' | 'paused' | 'terminated' | 'error';
 
+export interface ModelAssignment {
+  provider: string | null;
+  model: string | null;
+  slot_id: string | null;
+  slot_index: number | null;
+}
+
 export interface Agent {
   id: string;
   agent_type: AgentType;
@@ -71,6 +78,7 @@ export interface Agent {
   parent_agent_id: string | null;
   task_id: string | null;
   model_config: Record<string, unknown> | null;
+  model_assignment: ModelAssignment | null;
   created_at: string;
   updated_at: string;
   terminated_at: string | null;
@@ -146,6 +154,7 @@ export interface RecentActivity {
 export interface ModelInfo {
   name: string;
   max_context_tokens: number;
+  max_parallel_requests: number;
 }
 
 export interface ProviderConfig {
@@ -153,7 +162,7 @@ export interface ProviderConfig {
   display_name?: string;
   base_url: string;
   api_key?: string;
-  service_mode: 'parallel' | 'serial';
+  max_parallel_requests: number;
   models: ModelInfo[];
 }
 
@@ -174,7 +183,71 @@ export interface ModelInfoResponse {
   provider: string;
   model: string;
   max_context_tokens: number;
-  service_mode: string;
+  max_parallel_requests: number;
+}
+
+// Provider Scheduler types
+export interface SchedulerStatus {
+  total_active: number;
+  by_provider: Record<string, ProviderSlotAllocation[]>;
+  allocations: SlotAllocation[];
+  provider_config: {
+    total_max: Record<string, number>;
+    model_max: Record<string, Record<string, number>>;
+  };
+}
+
+export interface SlotAllocation {
+  id: string;
+  agent_id: string;
+  provider_name: string;
+  model_name: string;
+  priority: number;
+  priority_reason: string | null;
+  allocated_at: string;
+  last_heartbeat: string;
+  is_active: boolean;
+  is_released: boolean;
+  slot_index: number;
+  operation_type: string | null;
+  task_id: string | null;
+  subtask_id: string | null;
+}
+
+export interface ProviderSlotAllocation {
+  slot_id: string;
+  agent_id: string;
+  model: string;
+  slot_index: number;
+  priority: number;
+  operation: string;
+}
+
+export interface SchedulerSummary {
+  total_allocated: number;
+  by_provider: ProviderSummary[];
+}
+
+export interface ProviderSummary {
+  provider_name: string;
+  allocated: number;
+  max: number;
+  models: ModelSummary[];
+}
+
+export interface ModelSummary {
+  model_name: string;
+  allocated: number;
+  max: number;
+  slots: AgentSlotInfo[];
+}
+
+export interface AgentSlotInfo {
+  slot_index: number;
+  agent_id: string;
+  agent_name: string;
+  operation: string;
+  priority: number;
 }
 
 // Agent Settings types (replaces Agent Prompt types)
@@ -390,4 +463,48 @@ export interface ProfileLoadResult {
   profile_name: string;
   applied: number;
   skipped: number;
+}
+
+// Skill types
+export interface Skill {
+  name: string;
+  category: string;
+  description: string;
+  content: string | null;
+  is_builtin: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface SkillListItem {
+  name: string;
+  category: string;
+  description: string;
+  is_builtin: boolean;
+}
+
+export interface SkillListResponse {
+  items: SkillListItem[];
+  total: number;
+}
+
+export interface SkillCreate {
+  name: string;
+  category: string;
+  description: string;
+  content: string;
+}
+
+export interface SkillUpdate {
+  description?: string;
+  content?: string;
+}
+
+export interface CategoryListResponse {
+  categories: string[];
+}
+
+export interface SkillSearchResponse {
+  items: Skill[];
+  total: number;
 }

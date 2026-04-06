@@ -1,6 +1,7 @@
 """
 Tasks API for LongClaw.
 """
+import logging
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
@@ -8,6 +9,8 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 from backend.database import db_manager
 from backend.models.subtask import SubtaskStatus
@@ -301,6 +304,7 @@ async def terminate_task(
         HTTPException: If task not found.
     """
     from backend.services.agent_service import agent_service
+    from backend.services.agent_registry import agent_registry
     from backend.models.agent import AgentStatus, Agent
 
     # Get the task first
@@ -311,11 +315,18 @@ async def terminate_task(
     # Update task status
     task = await task_service.terminate_task(session, task_id)
 
-    # Terminate the owner agent if exists
+    # Terminate the owner agent in memory (set cancellation flag) and DB
     if task and task.owner_agent_id:
+        owner_in_mem = agent_registry.get_agent(task.owner_agent_id)
+        if owner_in_mem:
+            try:
+                await owner_in_mem.terminate()
+                logger.info(f"Terminated owner agent in memory: {task.owner_agent_id}")
+            except Exception as e:
+                logger.warning(f"Failed to terminate owner in memory: {e}")
         await agent_service.terminate_agent(session, task.owner_agent_id)
 
-    # Terminate all workers assigned to this task
+    # Terminate all workers assigned to this task (in memory and DB)
     from sqlalchemy import select
     result = await session.execute(
         select(Agent).where(
@@ -325,17 +336,26 @@ async def terminate_task(
     )
     workers = list(result.scalars().all())
     for worker in workers:
+        # Try to terminate in memory first
+        worker_in_mem = agent_registry.get_agent(worker.id)
+        if worker_in_mem:
+            try:
+                await worker_in_mem.terminate()
+                logger.info(f"Terminated worker agent in memory: {worker.id}")
+            except Exception as e:
+                logger.warning(f"Failed to terminate worker in memory: {e}")
+        # Always update DB status
         await agent_service.terminate_agent(session, worker.id)
 
     # Terminate all subtasks
-    subtasks = await task_service.get_subtasks(session, task_id)
+    subtasks = await task_service.get_task_subtasks(session, task_id)
     for subtask in subtasks:
         if subtask.status not in ("completed", "failed", "terminated"):
             await task_service.update_subtask_status(
                 session,
                 subtask.id,
-                "terminated",
-                error="Task terminated by user",
+                SubtaskStatus.TERMINATED,
+                result={"error": "Task terminated by user"},
             )
 
     # Refresh task to get latest state

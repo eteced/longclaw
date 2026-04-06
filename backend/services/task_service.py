@@ -338,7 +338,7 @@ class TaskService:
             subtask.summary = summary
         if result:
             subtask.result = result
-        if status == SubtaskStatus.COMPLETED:
+        if status in (SubtaskStatus.COMPLETED, SubtaskStatus.TERMINATED):
             subtask.completed_at = datetime.utcnow()
 
         await session.flush()

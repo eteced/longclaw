@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Plus, Trash2, Save, Eye, EyeOff, RefreshCw, Zap, Clock, AlertCircle, CheckCircle, Radio, Loader2, Infinity } from 'lucide-react';
+import { Plus, Trash2, Save, Eye, EyeOff, RefreshCw, Zap, Clock, AlertCircle, CheckCircle, Radio, Loader2, Infinity, Cpu, Users } from 'lucide-react';
 import { api } from '../services/api';
 import { LoadingSpinner } from '../components';
 import type { ModelConfig, ProviderConfig, ModelInfo } from '../types';
@@ -22,6 +22,27 @@ interface SpeedTestResult {
   error?: string;
 }
 
+interface SchedulerSummary {
+  total_allocated: number;
+  by_provider: Array<{
+    provider_name: string;
+    allocated: number;
+    max: number;
+    models: Array<{
+      model_name: string;
+      allocated: number;
+      max: number;
+      slots: Array<{
+        slot_index: number;
+        agent_id: string;
+        agent_name: string;
+        operation: string;
+        priority: number;
+      }>;
+    }>;
+  }>;
+}
+
 export const ModelConfigPage: React.FC = () => {
   const [config, setConfig] = useState<ModelConfig | null>(null);
   const [loading, setLoading] = useState(true);
@@ -33,6 +54,8 @@ export const ModelConfigPage: React.FC = () => {
   const [speedTestLoading, setSpeedTestLoading] = useState(false);
   const [speedTestResult, setSpeedTestResult] = useState<SpeedTestResult | null>(null);
   const [testProviderIndex, setTestProviderIndex] = useState<number | null>(null);
+  const [schedulerSummary, setSchedulerSummary] = useState<SchedulerSummary | null>(null);
+  
 
   useEffect(() => {
     const fetchConfig = async () => {
@@ -49,6 +72,19 @@ export const ModelConfigPage: React.FC = () => {
     };
 
     fetchConfig();
+    // Fetch scheduler summary periodically
+    const fetchSchedulerSummary = async () => {
+      try {
+        const summary = await api.getSchedulerSummary();
+        setSchedulerSummary(summary);
+      } catch (err) {
+        console.error('Failed to fetch scheduler summary:', err);
+      }
+    };
+
+    fetchSchedulerSummary();
+    const interval = setInterval(fetchSchedulerSummary, 5000);
+    return () => clearInterval(interval);
   }, []);
 
   const handleSave = async () => {
@@ -180,7 +216,7 @@ export const ModelConfigPage: React.FC = () => {
       display_name: 'New Provider',
       base_url: '',
       api_key: '',
-      service_mode: 'parallel',
+      max_parallel_requests: 10,
       models: [],
     };
     setConfig({ ...config, providers: [...config.providers, newProvider] });
@@ -229,6 +265,7 @@ export const ModelConfigPage: React.FC = () => {
           const newModels: ModelInfo[] = result.models.map((name: string) => ({
             name,
             max_context_tokens: 8192,
+            max_parallel_requests: 10,
           }));
           updateProvider(index, { models: newModels });
         }
@@ -306,6 +343,75 @@ export const ModelConfigPage: React.FC = () => {
             </option>
           ))}
         </select>
+      </div>
+
+      {/* Provider Scheduler Status */}
+      <div className="bg-white rounded-lg shadow p-6">
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2">
+            <Cpu className="w-5 h-5 text-blue-600" />
+            <h3 className="text-lg font-medium text-gray-900">Provider Scheduler</h3>
+          </div>
+          <div className="flex items-center gap-2 text-sm text-gray-500">
+            <span className="flex items-center gap-1">
+              <Users className="w-4 h-4" />
+              {schedulerSummary?.total_allocated || 0} slots allocated
+            </span>
+          </div>
+        </div>
+
+        <p className="text-sm text-gray-500 mb-4">
+          Shows how model inference slots are distributed among agents. Higher priority agents get slots first.
+        </p>
+
+        {schedulerSummary && schedulerSummary.total_allocated > 0 ? (
+          <div className="space-y-4">
+            {schedulerSummary.by_provider.map((provider) => (
+              <div key={provider.provider_name} className="border rounded-lg p-4">
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="font-medium text-gray-800">
+                    {provider.provider_name}
+                  </h4>
+                  <span className="text-sm text-gray-500">
+                    {provider.allocated} / {provider.max} slots used
+                  </span>
+                </div>
+                <div className="space-y-2">
+                  {provider.models.map((model) => (
+                    <div key={model.model_name} className="bg-gray-50 rounded-lg p-3">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-sm font-medium text-gray-700">
+                          {model.model_name}
+                        </span>
+                        <span className="text-xs text-gray-500">
+                          {model.allocated} / {model.max}
+                        </span>
+                      </div>
+                      {model.slots.length > 0 && (
+                        <div className="space-y-1">
+                          {model.slots.map((slot, idx) => (
+                            <div key={idx} className="flex items-center justify-between text-xs">
+                              <span className="text-gray-600">
+                                Slot {slot.slot_index}: <span className="font-medium">{slot.agent_name}</span>
+                              </span>
+                              <span className="px-2 py-0.5 bg-blue-100 text-blue-700 rounded">
+                                {slot.operation}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-center text-gray-500 py-8">
+            No active model allocations. Slots will be assigned when agents make LLM requests.
+          </div>
+        )}
       </div>
 
       {/* LLM Speed Test */}
@@ -530,18 +636,27 @@ export const ModelConfigPage: React.FC = () => {
 
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Service Mode
+                    Max Parallel Requests
                   </label>
-                  <select
-                    value={provider.service_mode || 'parallel'}
-                    onChange={(e) =>
-                      updateProvider(index, { service_mode: e.target.value as 'parallel' | 'serial' })
-                    }
-                    className="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
-                  >
-                    <option value="parallel">Parallel - Handle multiple requests concurrently</option>
-                    <option value="serial">Serial - Process requests one at a time</option>
-                  </select>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min="1"
+                      max="100"
+                      value={provider.max_parallel_requests || 10}
+                      onChange={(e) =>
+                        updateProvider(index, { max_parallel_requests: parseInt(e.target.value) || 10 })
+                      }
+                      className="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
+                      placeholder="10"
+                    />
+                    <span className="text-xs text-gray-500 whitespace-nowrap">
+                      concurrent requests
+                    </span>
+                  </div>
+                  <p className="text-xs text-gray-400 mt-1">
+                    Maximum number of agents that can use this provider simultaneously
+                  </p>
                 </div>
 
                 <div className="flex items-end">
@@ -619,6 +734,24 @@ export const ModelConfigPage: React.FC = () => {
                             <Infinity className="w-3 h-3" />
                           </label>
                         </div>
+                        <div className="flex items-center gap-2">
+                          <label className="text-xs text-gray-500 whitespace-nowrap">Max:</label>
+                          <input
+                            type="number"
+                            min="1"
+                            max="100"
+                            value={model.max_parallel_requests || 10}
+                            onChange={(e) => {
+                              const newModels = [...provider.models];
+                              newModels[modelIndex] = {
+                                ...model,
+                                max_parallel_requests: parseInt(e.target.value) || 10,
+                              };
+                              updateProvider(index, { models: newModels });
+                            }}
+                            className="w-16 px-2 py-1 text-sm rounded border-gray-300 focus:border-blue-500 focus:ring-blue-500"
+                          />
+                        </div>
                         <button
                           onClick={() => {
                             const newModels = provider.models.filter((_, i) => i !== modelIndex);
@@ -636,6 +769,7 @@ export const ModelConfigPage: React.FC = () => {
                         const newModel: ModelInfo = {
                           name: '',
                           max_context_tokens: 8192,
+                          max_parallel_requests: 10,
                         };
                         updateProvider(index, { models: [...provider.models, newModel] });
                       }}

@@ -10,6 +10,8 @@ from backend.models.conversation import Conversation
 from backend.models.knowledge import Knowledge
 from backend.models.message import Message, MessageType, SenderType, ReceiverType
 from backend.models.model_config import ModelConfig
+from backend.models.model_slot import ModelSlot
+from backend.models.skill import Skill
 from backend.models.subtask import Subtask, SubtaskStatus
 from backend.models.system_config import SystemConfig
 from backend.models.task import Task, TaskStatus
@@ -31,6 +33,8 @@ __all__ = [
     "SenderType",
     "ReceiverType",
     "ModelConfig",
+    "ModelSlot",
+    "Skill",
     "Subtask",
     "SubtaskStatus",
     "SystemConfig",

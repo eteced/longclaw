@@ -139,6 +139,9 @@ class SubAgent(BaseAgent):
         self._execution_messages: list[ChatMessage] = []
         self._completed = asyncio.Event()
         self._progress_callback: Any = None  # Optional callback to signal progress
+        # Cancellation mechanism for immediate termination
+        self._cancellation_event = asyncio.Event()
+        self._cancel_requested = False
 
         # Dynamic timeout manager - no max extension limit, extend as long as there's progress
         self._timeout_manager = TimeoutManager(
@@ -156,6 +159,19 @@ class SubAgent(BaseAgent):
     def is_completed(self) -> bool:
         """Check if the agent has completed its task."""
         return self._completed.is_set()
+
+    async def terminate(self) -> None:
+        """Terminate the SubAgent immediately.
+
+        Sets the cancellation flag which will stop execution at the next
+        check point (between tool rounds).
+        """
+        logger.info(f"SubAgent {self._id} termination requested")
+        self._cancel_requested = True
+        self._cancellation_event.set()
+        self._completed.set()
+        # Also call parent terminate to update status
+        await super().terminate()
 
     async def execute(self, task_description: str) -> str:
         """Execute a task and return the result.
@@ -213,18 +229,27 @@ class SubAgent(BaseAgent):
             self._completed.set()
             return result
 
-        except asyncio.TimeoutError:
+        except asyncio.CancelledError:
+            # Termination requested - this is not an error, it's intentional
+            logger.info(f"SubAgent {self._id} execution cancelled")
+            self._result = self._result or "任务已被终止"
+            self._completed.set()
+            return self._result
+
+        except asyncio.TimeoutError as e:
+            # Timeout should propagate to caller for proper handling
             current_timeout = self._timeout_manager.get_current_timeout()
             logger.warning(f"SubAgent {self._id} timed out after {current_timeout}s")
             self._result = f"任务执行超时（{current_timeout}秒）"
             self._completed.set()
-            return self._result
+            raise
 
         except Exception as e:
+            # LLM errors and other exceptions should propagate to caller for proper handling
             logger.exception(f"SubAgent {self._id} error: {e}")
             self._result = f"执行出错: {str(e)}"
             self._completed.set()
-            return self._result
+            raise
 
     async def _execute_with_tools(self, tools: list[dict[str, Any]]) -> str:
         """Execute task using tool-use loop.
@@ -253,10 +278,12 @@ class SubAgent(BaseAgent):
                 current_timeout = self._timeout_manager.get_current_timeout()
                 raise asyncio.TimeoutError(f"Agent timed out after {current_timeout}s")
 
-            # Check if agent was terminated externally
-            if await self._check_terminated():
-                logger.info(f"SubAgent {self._id} terminated, stopping execution")
-                return "任务已被终止"
+            # Check if agent was terminated externally OR cancellation was requested
+            if self._cancel_requested or await self._check_terminated():
+                logger.info(f"SubAgent {self._id} termination requested, stopping execution")
+                self._result = "任务已被终止"
+                self._completed.set()
+                raise asyncio.CancelledError("Agent terminated")
 
             tool_round += 1
             logger.debug(f"SubAgent {self._id} tool round {tool_round}")
@@ -274,6 +301,13 @@ class SubAgent(BaseAgent):
 
                 # Call LLM with tools
                 response = await llm_service.complete(messages, tools=tools)
+
+                # Check cancellation after LLM response returns
+                if self._cancel_requested:
+                    logger.info(f"SubAgent {self._id} cancellation requested after LLM response, stopping")
+                    self._result = "任务已被终止"
+                    self._completed.set()
+                    raise asyncio.CancelledError("Agent terminated after LLM response")
 
                 # Record progress after LLM response
                 self._timeout_manager.record_progress(

@@ -13,11 +13,12 @@ from backend.agents.base_agent import BaseAgent, TimeoutManager, get_current_dat
 from backend.agents.worker_agent import WorkerAgent
 from backend.database import db_manager
 from backend.models.agent import Agent, AgentType, AgentStatus
-from backend.models.message import Message
+from backend.models.message import Message, MessageType, SenderType, ReceiverType
 from backend.models.subtask import SubtaskStatus
 from backend.services.agent_settings_service import agent_settings_service
 from backend.services.config_service import config_service
 from backend.services.llm_service import ChatMessage
+from backend.services.message_service import message_service
 from backend.services.task_service import task_service
 
 logger = logging.getLogger(__name__)
@@ -31,14 +32,38 @@ OWNER_AGENT_SYSTEM_PROMPT = """你是一个任务调度专家，负责分析用�
 - 在子任务描述中包含具体的日期范围（如"2026年3月23日至2026年3月24日"）
 - 不要猜测日期，使用系统提供的时间信息
 
+## 可用工具
+- **web_search**: 搜索互联网信息，返回搜索结果列表
+- **web_fetch**: 获取网页详细内容
+- **execute_command**: 执行系统命令（创建文件、写代码、编译程序等）
+- **search_memory**: 搜索知识库记忆
+- **store_memory**: 存储信息到知识库
+
+## 任务类型识别与工具选择
+
+### 信息查询类任务
+- 问题：查询信息、搜索新闻、获取数据
+- 工具：["web_search", "web_fetch"]
+- 示例：查天气、搜新闻、找文档
+
+### 创作/构建类任务 【关键！】
+- 问题：编写代码、创建文件、生成项目
+- 工具：["web_search", "web_fetch", "execute_command"]
+- **必须包含 execute_command**，否则无法创建文件！
+- 示例：写一个 Python 脚本、创建 C++ 项目、生成配置文件
+
+### 分析/处理类任务
+- 问题：数据分析、文件处理、格式转换
+- 工具：["execute_command"] 或 ["web_search", "execute_command"]
+- 示例：批量重命名文件、转换数据格式、分析日志
+
 ## 核心原则
 
-### 1. 先评估信息缺口
-拆解任务前，先分析：
-- 是否需要当前时间信息？（已在系统消息中提供）
-- 是否需要搜索最新信息？
-- 是否需要背景知识？
-- 如果缺少必要信息，将信息收集作为第一个子任务
+### 1. 先评估任务类型
+拆解任务前，先判断：
+- 这是纯信息查询？→ 只需 web_search/web_fetch
+- 这需要创建/修改文件？→ 必须包含 execute_command
+- 这需要执行代码？→ 必须包含 execute_command
 
 ### 2. 最大化并行化
 - 不同信息来源的搜索可以并行执行
@@ -63,16 +88,35 @@ OWNER_AGENT_SYSTEM_PROMPT = """你是一个任务调度专家，负责分析用�
 - 让 Worker Agent 无需额外推理就能执行
 - 避免模糊的描述如"搜索相关新闻"
 
+### 5. 【关键】为 Worker 提供充分上下文
+创建 Worker 之前，必须确保子任务描述包含足够执行任务的上下文信息：
+
+**必须提供的上下文（当任务涉及时）：**
+- **代码执行/文件操作任务**：必须包含当前工作目录、项目路径等信息
+- **需要使用工具的任务**：描述中应包含工具所需的具体参数或数据来源
+- **跨目录/跨项目任务**：必须明确说明文件路径和操作位置
+
+**上下文验证清单（创建 Worker 前检查）：**
+1. 任务描述是否包含执行所需的所有必要信息？
+2. 是否需要提供工作目录路径？
+3. 是否需要提供具体的文件路径或项目结构信息？
+4. Worker 拿到这个描述后，能否无需额外询问即可执行？
+
+**如果上下文不足怎么办？**
+- 如果任务描述缺少关键上下文，在创建 Worker 前先补充完整
+- 不要假设 Worker 知道项目结构、工作目录等信息
+- 上下文信息应该明确写在任务描述中，而不是依赖 Worker 去猜测
+
 ## 输出格式
 分析任务后，返回 JSON 格式的子任务列表：
 ```json
 {
-  "analysis": "任务分析说明，包括信息缺口分析和并行化策略",
+  "analysis": "任务分析说明，包括任务类型、信息缺口分析和并行化策略",
   "subtasks": [
     {
       "id": "1",
       "description": "子任务描述（具体、明确、包含参数）",
-      "tools_needed": ["web_search", "web_fetch"],
+      "tools_needed": ["web_search", "web_fetch", "execute_command"],
       "priority": 0,
       "depends_on": []
     }
@@ -80,10 +124,17 @@ OWNER_AGENT_SYSTEM_PROMPT = """你是一个任务调度专家，负责分析用�
 }
 ```
 
+**⚠️ JSON格式注意事项（非常重要）：**
+- 每个子任务对象必须严格遵循 `{ "id": "...", ... }` 格式
+- 不要在子任务对象外再嵌套大括号，如 `{{ "id": "1" }}` 是错误的
+- 确保每个 `{` 都有对应的 `}`，每个 `[` 都有对应的 `]`
+- 子任务之间用逗号分隔，最后一个子任务后面不要加逗号
+- 输出前请检查JSON是否有效
+
 **字段说明：**
 - `id`: 子任务唯一标识（字符串，如"1"、"2"、"3"）
 - `description`: 子任务描述
-- `tools_needed`: 需要的工具列表
+- `tools_needed`: 需要的工具列表（创作类任务必须包含 execute_command！）
 - `priority`: 优先级（整数，默认0，数值越大优先级越高）
 - `depends_on`: 依赖的子任务ID列表（如 ["1", "2"] 表示需要等1和2完成后才能执行）
   **重要：如果子任务需要其他子任务的结果，此字段必须填写依赖的ID，不能为空数组！**
@@ -262,6 +313,88 @@ SYNTHESIS_SYSTEM_PROMPT = """你是一个信息整合专家，负责整合多个
 - 突出重点，简洁有力
 - 使用中文回复"""
 
+# System prompt for task completion evaluation
+COMPLETION_EVALUATION_PROMPT = """你是一个任务完成度评估专家。你的任务是分析用户原始请求和子任务执行结果，判断任务是否真正完成。
+
+## 任务
+1. 分析用户的原始请求，明确用户真正想要的结果
+2. 检查子任务执行结果，判断是否已产出用户想要的结果
+3. 如果未完成，确定还需要哪些后续步骤
+
+## 判断规则
+
+### 信息查询类任务
+- **完成**：已获取完整信息，能够回答用户问题
+- **未完成**：信息不完整，无法回答核心问题
+
+### 编程/创建类任务 【关键】
+- **完成**：已创建文件/代码，用户可以直接使用
+- **未完成**：只做了搜索、规划、设计，但没有实际创建文件或代码
+- **特别注意**：如果用户要求"写一个程序"，只搜索教程/设计架构不算完成，必须生成可用的代码文件！
+
+### 分析/处理类任务
+- **完成**：已完成分析/处理，产出结果
+- **未完成**：只做了准备工作，没有实际处理
+
+## 输出格式
+返回 JSON 格式：
+```json
+{
+  "is_completed": true/false,
+  "completion_percentage": 0-100,
+  "what_was_done": "已完成的工件简述",
+  "what_is_missing": "还缺少什么（如果未完成）",
+  "next_steps": [
+    {
+      "description": "后续子任务描述",
+      "tools_needed": ["execute_command"],
+      "reason": "为什么需要这个步骤"
+    }
+  ]
+}
+```
+
+## 示例1：完成的编程任务
+用户请求：创建一个 Hello World Python 脚本
+执行结果：使用 execute_command 创建了 hello.py 文件
+
+输出：
+```json
+{
+  "is_completed": true,
+  "completion_percentage": 100,
+  "what_was_done": "已创建 hello.py 文件，内容为 print('Hello World')",
+  "what_is_missing": "",
+  "next_steps": []
+}
+```
+
+## 示例2：未完成的编程任务
+用户请求：编写一个 WAV 转 OGG 的 C++ 程序
+执行结果：只搜索了 WAV/OGG 格式资料和设计方案
+
+输出：
+```json
+{
+  "is_completed": false,
+  "completion_percentage": 30,
+  "what_was_done": "搜索了音频格式资料，设计了项目架构",
+  "what_is_missing": "没有实际编写代码、创建项目文件",
+  "next_steps": [
+    {
+      "description": "根据设计方案，创建 C++ 项目结构和主要源代码文件",
+      "tools_needed": ["execute_command"],
+      "reason": "需要创建实际的代码文件"
+    },
+    {
+      "description": "编写 WAV 解析模块代码",
+      "tools_needed": ["execute_command"],
+      "reason": "需要实现 WAV 文件读取功能"
+    }
+  ]
+}
+```"""
+
 
 @dataclass
 class SubtaskSpec:
@@ -281,6 +414,16 @@ class SubtaskResult:
     result: str
     success: bool
     error: str | None = None
+
+
+@dataclass
+class CompletionEvaluation:
+    """Result of task completion evaluation."""
+    is_completed: bool
+    completion_percentage: int
+    what_was_done: str
+    what_is_missing: str
+    next_steps: list[dict[str, Any]]  # List of {"description": ..., "tools_needed": ..., "reason": ...}
 
 
 class OwnerAgent(BaseAgent):
@@ -333,6 +476,10 @@ class OwnerAgent(BaseAgent):
             min_progress_interval=60,
         )
 
+        # Task context for multi-turn conversation support
+        # Stores the original task request to provide context for evaluation and worker responses
+        self._task_context: str = ""
+
     async def persist(self) -> str:
         """Persist the agent to database with OwnerAgent-specific logic.
 
@@ -357,6 +504,9 @@ class OwnerAgent(BaseAgent):
     async def execute(self, user_request: str) -> str:
         """Execute a task by decomposing and orchestrating WorkerAgents.
 
+        Supports iterative execution: if task is not completed after first round,
+        will generate follow-up subtasks and continue until completion or max iterations.
+
         Args:
             user_request: The user's task request.
 
@@ -370,18 +520,30 @@ class OwnerAgent(BaseAgent):
         logger.info(f"OwnerAgent {self._id} starting task: {user_request[:100]}...")
         await self._update_status(AgentStatus.RUNNING)
 
+        # Store task context for multi-turn support (evaluation and worker responses)
+        self._task_context = user_request
+
         # Resolve base timeout from config
         # Note: get_float returns None when config value is -1 (unlimited)
         base_timeout = self._timeout or await config_service.get_float("owner_task_timeout", 600.0)
         self._timeout_manager._base_timeout = int(base_timeout) if base_timeout is not None else None
         self._timeout_manager.start()
 
+        # Get max iterations from config (default 5, -1 means unlimited)
+        max_iterations = await config_service.get_int("owner_max_iterations", 5)
+        # None means unlimited, use a very large number (effectively unlimited)
+        effective_max_iterations = max_iterations if max_iterations is not None else 9999
+        current_iteration = 0
+
+        # Track all results across iterations
+        all_results: list[SubtaskResult] = []
+
         try:
             # Check if terminated before starting
             if await self._check_terminated():
                 return "任务已被终止"
 
-            # Step 1: Decompose task
+            # Initial task decomposition
             subtasks = await self._decompose_task(user_request)
             self._timeout_manager.record_progress("decompose", f"Decomposed into {len(subtasks)} subtasks")
             logger.info(f"OwnerAgent {self._id} decomposed into {len(subtasks)} subtasks")
@@ -390,23 +552,93 @@ class OwnerAgent(BaseAgent):
                 await self._update_status(AgentStatus.ERROR)
                 return "抱歉，我无法分析这个任务。请换种方式描述一下？"
 
-            # Check termination before executing subtasks
+            # Iterative execution loop
+            while current_iteration < effective_max_iterations:
+                current_iteration += 1
+                logger.info(f"OwnerAgent {self._id} starting iteration {current_iteration}/{max_iterations if max_iterations else 'unlimited'}")
+
+                # Check termination before executing subtasks
+                if await self._check_terminated():
+                    return "任务已被终止"
+
+                # Execute current batch of subtasks
+                results = await self._execute_subtasks(subtasks, user_request)
+                all_results.extend(results)
+                self._timeout_manager.record_progress(
+                    f"execute_iter_{current_iteration}",
+                    f"Executed {len(results)} subtasks in iteration {current_iteration}"
+                )
+                logger.info(f"OwnerAgent {self._id} iteration {current_iteration} got {len(results)} results")
+
+                # Check termination before evaluation
+                if await self._check_terminated():
+                    return "任务已被终止"
+
+                # Evaluate task completion
+                evaluation = await self._evaluate_completion(user_request, all_results)
+                logger.info(
+                    f"OwnerAgent {self._id} completion evaluation: "
+                    f"{evaluation.completion_percentage}% complete, is_completed={evaluation.is_completed}"
+                )
+
+                # If completed or no next steps, break
+                if evaluation.is_completed:
+                    logger.info(f"OwnerAgent {self._id} task completed after {current_iteration} iterations")
+                    break
+
+                if not evaluation.next_steps:
+                    logger.info(f"OwnerAgent {self._id} no next steps suggested, proceeding to synthesis")
+                    break
+
+                # Check if we have more iterations
+                if max_iterations is not None and current_iteration >= max_iterations:
+                    logger.warning(
+                        f"OwnerAgent {self._id} reached max iterations ({max_iterations}), "
+                        f"task only {evaluation.completion_percentage}% complete"
+                    )
+                    # Add a note about incomplete task to results for better synthesis
+                    all_results.append(SubtaskResult(
+                        subtask_id="_incomplete_note",
+                        description="[系统提示] 达到最大迭代次数，任务可能未完全完成",
+                        result=f"任务完成度: {evaluation.completion_percentage}%\n"
+                               f"已完成: {evaluation.what_was_done}\n"
+                               f"未完成: {evaluation.what_is_missing}",
+                        success=False,
+                        error=None,
+                    ))
+                    break
+
+                # Generate follow-up subtasks from next_steps
+                # Use iteration number and index to create unique IDs
+                subtasks = []
+                for i, step in enumerate(evaluation.next_steps):
+                    subtasks.append(SubtaskSpec(
+                        id=f"iter{current_iteration}_step{i}",
+                        description=step.get("description", ""),
+                        tools_needed=step.get("tools_needed", ["execute_command"]),
+                        priority=0,
+                        depends_on=[],  # Follow-up tasks don't have dependencies
+                    ))
+                logger.info(f"OwnerAgent {self._id} generated {len(subtasks)} follow-up subtasks from next_steps")
+
+                # If no subtasks were generated but task is not complete, create a default continuation
+                if not subtasks:
+                    logger.warning(f"OwnerAgent {self._id} no follow-up subtasks generated but task incomplete, creating default continuation")
+                    subtasks.append(SubtaskSpec(
+                        id=f"iter{current_iteration}_continue",
+                        description=f"继续执行任务。根据之前的执行结果，完成以下工作：{evaluation.what_is_missing}",
+                        tools_needed=["execute_command"],
+                        priority=0,
+                        depends_on=[],
+                    ))
+
+            # Final synthesis
             if await self._check_terminated():
                 return "任务已被终止"
 
-            # Step 2: Execute subtasks in parallel
-            results = await self._execute_subtasks(subtasks)
-            self._timeout_manager.record_progress("execute", f"Executed {len(results)} subtasks")
-            logger.info(f"OwnerAgent {self._id} got {len(results)} results")
+            final_response = await self._synthesize_results(user_request, all_results)
 
-            # Check termination before synthesis
-            if await self._check_terminated():
-                return "任务已被终止"
-
-            # Step 3: Synthesize results
-            final_response = await self._synthesize_results(user_request, results)
-
-            await self._update_status(AgentStatus.IDLE)
+            await self._update_status(AgentStatus.DONE)
             self._completed.set()
             return final_response
 
@@ -610,8 +842,92 @@ class OwnerAgent(BaseAgent):
         subtasks, _ = self._parse_subtasks_with_plan(content)
         return subtasks
 
+    def _try_repair_json(self, json_str: str) -> str:
+        """Attempt to repair common JSON format errors.
+
+        Args:
+            json_str: Potentially malformed JSON string.
+
+        Returns:
+            Repaired JSON string (best effort).
+        """
+        import re
+
+        repaired = json_str
+
+        # Fix 1: Remove duplicate opening braces in objects (e.g., {{ -> {)
+        # This handles the case where LLM outputs { { "id": "2" } }
+        repaired = re.sub(r'\{\s*\{', '{', repaired)
+
+        # Fix 2: Remove duplicate closing braces (e.g., }} -> })
+        repaired = re.sub(r'\}\s*\}', '}', repaired)
+
+        # Fix 3: Fix trailing commas before closing brackets/braces
+        repaired = re.sub(r',\s*}', '}', repaired)
+        repaired = re.sub(r',\s*\]', ']', repaired)
+
+        # Fix 4: Remove multiple consecutive commas
+        repaired = re.sub(r',+', ',', repaired)
+
+        # Fix 5: Fix missing commas between array elements
+        # This is complex and may introduce issues, so we skip it
+
+        # Fix 6: Remove non-JSON text before/after the main object
+        # Find the outermost balanced braces
+        if repaired.count('{') > 0 and repaired.count('}') > 0:
+            first_brace = repaired.find('{')
+            last_brace = repaired.rfind('}')
+            if first_brace >= 0 and last_brace > first_brace:
+                repaired = repaired[first_brace:last_brace + 1]
+
+        return repaired
+
+    def _extract_subtasks_from_malformed_json(self, json_str: str) -> list[dict]:
+        """Extract subtask objects from malformed JSON using regex patterns.
+
+        This is a fallback when JSON parsing completely fails.
+
+        Args:
+            json_str: Malformed JSON string.
+
+        Returns:
+            List of extracted subtask dictionaries.
+        """
+        import re
+
+        subtasks = []
+
+        # Pattern to match subtask objects with id, description, tools_needed, etc.
+        # This handles cases where JSON is malformed but individual objects are parseable
+        pattern = r'\{\s*"id"\s*:\s*"?(\w+)"?\s*,\s*"description"\s*:\s*"([^"]*(?:\\.[^"]*)*)"\s*(?:,\s*"tools_needed"\s*:\s*\[([^\]]*)\])?'
+
+        matches = re.findall(pattern, json_str, re.DOTALL)
+
+        for match in matches:
+            subtask_id = match[0]
+            description = match[1].replace('\\"', '"').replace('\\n', '\n')
+
+            # Parse tools_needed if present
+            tools_str = match[2] if len(match) > 2 else ""
+            tools_needed = []
+            if tools_str:
+                tools_needed = re.findall(r'"([^"]*)"', tools_str)
+
+            if description:  # Only add if we have a description
+                subtasks.append({
+                    "id": subtask_id,
+                    "description": description,
+                    "tools_needed": tools_needed if tools_needed else ["web_search", "web_fetch"],
+                    "priority": 0,
+                    "depends_on": []
+                })
+
+        return subtasks
+
     def _parse_subtasks_with_plan(self, content: str) -> tuple[list[SubtaskSpec], dict[str, Any] | None]:
         """Parse subtasks and plan data from LLM response.
+
+        Enhanced with JSON repair and regex fallback for robustness.
 
         Args:
             content: LLM response content.
@@ -643,20 +959,47 @@ class OwnerAgent(BaseAgent):
                 json_match = content[start:end]
 
         if json_match:
+            # Try direct parsing first
+            data = None
             try:
                 data = json.loads(json_match)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Initial JSON parse failed: {e}, attempting repair...")
+
+                # Try to repair the JSON
+                repaired_json = self._try_repair_json(json_match)
+                try:
+                    data = json.loads(repaired_json)
+                    logger.info("JSON repair successful")
+                except json.JSONDecodeError as e2:
+                    logger.warning(f"JSON repair failed: {e2}, trying regex extraction...")
+
+                    # Last resort: extract subtasks using regex
+                    extracted = self._extract_subtasks_from_malformed_json(json_match)
+                    if extracted:
+                        data = {"subtasks": extracted}
+                        logger.info(f"Extracted {len(extracted)} subtasks using regex fallback")
+
+            if data:
                 # Store the full plan data (including analysis)
                 plan_data = {
                     "analysis": data.get("analysis", ""),
                     "subtasks": []
                 }
                 for item in data.get("subtasks", []):
+                    # Validate required fields
+                    if not isinstance(item, dict):
+                        continue
+                    description = item.get("description", "")
+                    if not description:
+                        continue
+
                     subtask_spec = SubtaskSpec(
                         id=str(item.get("id", len(subtasks) + 1)),
-                        description=item.get("description", ""),
-                        tools_needed=item.get("tools_needed", ["web_search", "web_fetch"]),
-                        priority=item.get("priority", 0),
-                        depends_on=item.get("depends_on", []),
+                        description=description,
+                        tools_needed=item.get("tools_needed", ["web_search", "web_fetch"]) or ["web_search", "web_fetch"],
+                        priority=item.get("priority", 0) or 0,
+                        depends_on=item.get("depends_on", []) or [],
                     )
                     subtasks.append(subtask_spec)
                     # Add to plan data
@@ -667,16 +1010,17 @@ class OwnerAgent(BaseAgent):
                         "priority": subtask_spec.priority,
                         "depends_on": subtask_spec.depends_on,
                     })
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse JSON: {e}")
 
-        # If no subtasks parsed, create a default one
+        # If no subtasks parsed, create a default one with proper task description
         if not subtasks:
-            logger.warning("No subtasks parsed from LLM response, using fallback")
+            logger.warning("No subtasks parsed from LLM response, using intelligent fallback")
+            # Instead of using entire LLM response, extract just the user request portion
+            # This typically appears at the beginning or in a specific pattern
+            fallback_desc = self._extract_fallback_description(content)
             subtasks.append(SubtaskSpec(
                 id="1",
-                description=content,  # Use the LLM response as task description
-                tools_needed=["web_search", "web_fetch"],
+                description=fallback_desc,
+                tools_needed=["web_search", "web_fetch", "execute_command"],
                 priority=0,
                 depends_on=[],
             ))
@@ -684,7 +1028,241 @@ class OwnerAgent(BaseAgent):
 
         return subtasks, plan_data
 
-    async def _execute_subtasks(self, subtasks: list[SubtaskSpec]) -> list[SubtaskResult]:
+    def _extract_fallback_description(self, content: str) -> str:
+        """Extract a meaningful task description for fallback subtask.
+
+        Args:
+            content: The full LLM response content.
+
+        Returns:
+            A concise task description.
+        """
+        # Try to extract the analysis or summary from the content
+        import re
+
+        # Look for analysis section
+        analysis_match = re.search(r'"analysis"\s*:\s*"([^"]+)"', content)
+        if analysis_match:
+            return f"请完成以下任务：{analysis_match.group(1)[:500]}"
+
+        # Look for the original user request pattern
+        if "用户任务" in content or "用户请求" in content:
+            lines = content.split('\n')
+            for i, line in enumerate(lines):
+                if "用户任务" in line or "用户请求" in line:
+                    # Return next few lines as context
+                    context = '\n'.join(lines[i:i+3])
+                    return f"请完成以下任务：{context[:500]}"
+
+        # Fallback: use first meaningful sentence
+        sentences = re.split(r'[。\n]', content)
+        for sentence in sentences:
+            if len(sentence) > 20 and not sentence.startswith('{') and not sentence.startswith('```'):
+                return f"请完成以下任务：{sentence[:500]}"
+
+        return "请分析并完成用户的任务请求"
+
+    def _build_worker_context(self) -> str:
+        """Build system context for workers.
+
+        This context includes important information that workers need
+        to properly execute tasks, such as working directory and project paths.
+
+        Returns:
+            System context string to be prepended to task descriptions.
+        """
+        import os
+
+        context_parts = [
+            "【系统上下文 - 请在执行任务时注意】",
+            f"当前工作目录: {os.getcwd()}",
+        ]
+
+        # Add project root if we're in a known project structure
+        cwd = os.getcwd()
+        if "longclaw" in cwd:
+            context_parts.append(f"项目根目录: {cwd}")
+            context_parts.append("注意: LongClaw 项目位于当前目录的 longclaw 子目录下")
+            context_parts.append("如果需要操作 LongClaw 项目文件，请使用完整路径")
+
+        context_parts.append("=" * 40)
+
+        return "\n".join(context_parts)
+
+    def _validate_task_context(self, spec: SubtaskSpec, description: str) -> bool:
+        """Validate that the task description has sufficient context for execution.
+
+        Args:
+            spec: The subtask specification.
+            description: The task description.
+
+        Returns:
+            True if context is sufficient, False otherwise.
+        """
+        issues = []
+
+        # Check for execute_command tool usage
+        if "execute_command" in spec.tools_needed:
+            # These keywords suggest the task needs file/directory context
+            context_keywords = [
+                "目录", "文件夹", "路径", "项目", "文件",
+                "path", "directory", "folder", "project", "file",
+                "编译", "运行", "执行", "创建", "修改",
+                "run", "compile", "execute", "create", "modify"
+            ]
+            has_context = any(kw in description for kw in context_keywords)
+            if not has_context:
+                issues.append(
+                    f"Subtask {spec.id} uses execute_command but description lacks "
+                    "file/directory context keywords"
+                )
+
+        # Check description length (very short descriptions likely lack context)
+        if len(description) < 20:
+            issues.append(
+                f"Subtask {spec.id} description is very short ({len(description)} chars), "
+                "likely lacks sufficient context"
+            )
+
+        if issues:
+            logger.warning(" | ".join(issues))
+            return False
+
+        return True
+
+    async def _handle_worker_questions(self) -> None:
+        """Handle any pending clarification questions from workers.
+
+        This method checks for QUESTION messages from workers and sends
+        TEXT responses back to them. Uses LLM to generate intelligent
+        context-aware responses based on the task goal and worker question.
+
+        Called when Owner is allocated with WORKER_WAITING_OWNER priority.
+        """
+        try:
+            async with db_manager.session() as session:
+                from sqlalchemy import select, and_
+
+                # Find QUESTION messages sent to this Owner
+                result = await session.execute(
+                    select(Message)
+                    .where(
+                        and_(
+                            Message.receiver_id == self._id,
+                            Message.receiver_type == ReceiverType.OWNER,
+                            Message.message_type == MessageType.QUESTION
+                        )
+                    )
+                    .order_by(Message.created_at.asc())
+                    .limit(10)
+                )
+                questions = list(result.scalars().all())
+
+                for question in questions:
+                    worker_id = question.sender_id
+                    worker_name = "Worker"
+                    question_content = question.content or ""
+
+                    logger.info(f"Owner handling question from {worker_name} ({worker_id}): {question_content[:100]}...")
+
+                    # Load the full conversation context for this worker
+                    # to generate a context-aware response
+                    from sqlalchemy import select as sa_select
+                    conv_result = await session.execute(
+                        sa_select(Message)
+                        .where(
+                            and_(
+                                Message.sender_id == worker_id,
+                                Message.task_id == self._task_id,
+                            )
+                        )
+                        .order_by(Message.created_at.asc())
+                    )
+                    worker_messages = list(conv_result.scalars().all())
+
+                    # Build conversation history for LLM
+                    conversation_context = self._build_evaluation_context(
+                        question_content,
+                        [m.content for m in worker_messages if m.content],
+                        is_worker_question=True
+                    )
+
+                    # Generate intelligent response using LLM
+                    response_content = await self._generate_worker_response(
+                        worker_id=worker_id,
+                        worker_question=question_content,
+                        conversation_context=conversation_context,
+                    )
+
+                    # Send TEXT response to worker
+                    await message_service.create_message(
+                        session,
+                        sender_type=SenderType.OWNER,
+                        sender_id=self._id,
+                        receiver_type=ReceiverType.WORKER,
+                        receiver_id=worker_id,
+                        content=response_content,
+                        message_type=MessageType.TEXT,
+                        task_id=self._task_id,
+                    )
+                    logger.info(f"Owner sent LLM-generated response to {worker_name} ({worker_id})")
+
+        except Exception as e:
+            logger.warning(f"Error handling worker questions: {e}")
+
+    async def _generate_worker_response(
+        self,
+        worker_id: str,
+        worker_question: str,
+        conversation_context: str,
+    ) -> str:
+        """Generate an intelligent response to a worker's question using LLM.
+
+        This enables multi-turn conversation between Owner and Workers,
+        so Owner can provide context-aware guidance based on the task goal
+        and the worker's specific question.
+
+        Args:
+            worker_id: ID of the worker asking the question.
+            worker_question: The question from the worker.
+            conversation_context: Context about the task and prior conversation.
+
+        Returns:
+            Generated response to send to the worker.
+        """
+        from backend.services.llm_service import llm_service
+
+        datetime_str = get_current_datetime_str()
+        prompt = f"""{datetime_str}
+
+你是一个任务管理Agent，需要回复Worker的问题。Worker正在执行子任务时遇到了需要澄清的问题。
+
+{conversation_context}
+
+【Worker的问题】
+{worker_question}
+
+请回复Worker的问题，提供足够的上下文和指导。回复要简洁、准确，帮助Worker继续执行任务。
+如果Worker询问的是任务目标相关的问题，请结合原始任务目标回答。
+如果Worker询问的是操作相关的问题，请提供具体的指导。"""
+
+        messages = [
+            ChatMessage(role="system", content="你是一个任务管理Agent，负责协调Worker执行任务。"),
+            ChatMessage(role="user", content=prompt),
+        ]
+
+        try:
+            response = await llm_service.complete(messages)
+            return response.content.strip()
+        except Exception as e:
+            logger.warning(f"Failed to generate LLM response for worker: {e}")
+            # Fallback to simple response
+            return (
+                f"收到你的问题：{worker_question}\n\n"
+                f"请根据任务目标继续执行。如果确实无法执行，请说明原因并报告任务失败。"
+            )
+
+    async def _execute_subtasks(self, subtasks: list[SubtaskSpec], user_request: str = "") -> list[SubtaskResult]:
         """Execute subtasks with dependency support and context passing.
 
         Creates Subtask records in DB and tracks execution.
@@ -694,6 +1272,7 @@ class OwnerAgent(BaseAgent):
 
         Args:
             subtasks: List of subtask specifications.
+            user_request: The original user request for context.
 
         Returns:
             List of subtask results.
@@ -729,6 +1308,9 @@ class OwnerAgent(BaseAgent):
 
         async def run_subtask(spec: SubtaskSpec) -> None:
             """Run a single subtask with context from dependencies and retry on failure."""
+            # Get system context that all workers need (working directory, project paths, etc.)
+            system_context = self._build_worker_context()
+
             # Build context from dependency results
             context_parts = []
             if spec.depends_on:
@@ -740,13 +1322,33 @@ class OwnerAgent(BaseAgent):
                         else:
                             context_parts.append(f"【依赖任务 {dep_id} 失败】\n{dep_result.error}")
 
-            # Build enhanced task description with dependency context
+            # Build enhanced task description with system context and dependency context
+            description_parts = [spec.description]
+
+            # Add system context first
+            description_parts.append(f"\n{system_context}\n")
+
+            # Add original user request for context - CRITICAL for workers to understand the overall goal
+            if user_request:
+                description_parts.append(f"\n【原始用户请求】\n{user_request}\n")
+
+            # Add dependency context if available
             if context_parts:
-                enhanced_description = f"{spec.description}\n\n{'='*40}\n以下是依赖任务的执行结果，请在执行时参考：\n\n" + "\n\n".join(context_parts)
+                description_parts.append(f"\n{'='*40}\n以下是依赖任务的执行结果，请在执行时参考：\n\n" + "\n\n".join(context_parts))
                 logger.info(f"Subtask {spec.id} enhanced with context from dependencies: {spec.depends_on}")
             else:
-                enhanced_description = spec.description
                 logger.info(f"Subtask {spec.id} has no dependencies, executing directly")
+
+            enhanced_description = "\n".join(description_parts)
+
+            # Validate task context before creating worker
+            # This warns if the description seems to lack sufficient context
+            has_sufficient_context = self._validate_task_context(spec, enhanced_description)
+            if not has_sufficient_context:
+                logger.warning(
+                    f"Subtask {spec.id} may have insufficient context. "
+                    f"Consider adding more details to the task description."
+                )
 
             # Try execution with retry (max 2 attempts)
             max_attempts = 2
@@ -800,6 +1402,10 @@ class OwnerAgent(BaseAgent):
                         error="Task terminated by user",
                     )
                 break
+
+            # Handle any pending questions from workers before starting new wave
+            # This allows Owner to respond to workers that need clarification
+            await self._handle_worker_questions()
 
             # Find tasks whose dependencies are all satisfied
             ready = [
@@ -991,6 +1597,259 @@ class OwnerAgent(BaseAgent):
                 success=False,
                 error=str(e),
             )
+
+    async def _get_owner_worker_conversation(self) -> str:
+        """Load recent conversation history between Owner and Workers.
+
+        This enables multi-turn context for evaluation - the Owner can see
+        what questions Workers asked and what answers Owner provided.
+
+        Returns:
+            Formatted conversation history string.
+        """
+        if not self._task_id:
+            return ""
+
+        try:
+            async with db_manager.session() as session:
+                from sqlalchemy import select, or_, and_, asc
+
+                # Get all messages related to this task involving Owner or Workers
+                result = await session.execute(
+                    select(Message)
+                    .where(
+                        and_(
+                            Message.task_id == self._task_id,
+                            or_(
+                                Message.sender_type == SenderType.OWNER,
+                                Message.sender_type == SenderType.WORKER,
+                            )
+                        )
+                    )
+                    .order_by(asc(Message.created_at))
+                    .limit(50)
+                )
+                messages = list(result.scalars().all())
+
+                if not messages:
+                    return ""
+
+                # Format conversation
+                lines = []
+                for msg in messages[-20:]:  # Last 20 messages
+                    sender = "Owner" if msg.sender_type == SenderType.OWNER else "Worker"
+                    content = msg.content or ""
+                    if len(content) > 500:
+                        content = content[:500] + "..."
+                    lines.append(f"{sender}: {content}")
+
+                return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"Failed to load owner-worker conversation: {e}")
+            return ""
+
+    async def _evaluate_completion(
+        self,
+        user_request: str,
+        results: list[SubtaskResult],
+    ) -> CompletionEvaluation:
+        """Evaluate if the task is completed based on results.
+
+        Args:
+            user_request: Original user request.
+            results: List of subtask results from execution.
+
+        Returns:
+            CompletionEvaluation with completion status and next steps if needed.
+        """
+        from backend.services.llm_service import llm_service
+
+        # Build evaluation context using the shared helper
+        conversation_history = self._get_owner_worker_conversation()
+        context_parts = []
+
+        # Add task context (includes conversation history from ResidentAgent)
+        if self._task_context:
+            context_parts.append(f"【任务背景】\n{self._task_context}")
+
+        # Add Owner-Worker conversation history for multi-turn context
+        if conversation_history:
+            context_parts.append(f"【Owner与Worker的对话历史】\n{conversation_history}")
+
+        context_parts.append("=" * 50)
+        context_parts.append("\n【子任务执行结果】")
+        for i, r in enumerate(results, 1):
+            context_parts.append(f"\n子任务 {i}: {r.description}")
+            if r.success:
+                result_preview = r.result[:2000] if len(r.result) > 2000 else r.result
+                context_parts.append(f"结果:\n{result_preview}\n")
+            else:
+                context_parts.append(f"执行失败: {r.error}\n")
+
+        context = "\n".join(context_parts)
+
+        # Inject current date/time into system prompt
+        datetime_str = get_current_datetime_str()
+        full_system_prompt = f"{datetime_str}\n\n{COMPLETION_EVALUATION_PROMPT}"
+
+        messages = [
+            ChatMessage(role="system", content=full_system_prompt),
+            ChatMessage(role="user", content=f"请评估以下任务的完成度:\n\n{context}"),
+        ]
+
+        try:
+            # Use shorter timeout for evaluation
+            timeout = 60  # 1 minute should be enough for evaluation
+            response = await asyncio.wait_for(
+                llm_service.complete(messages),
+                timeout=timeout
+            )
+            return self._parse_completion_response(response.content)
+
+        except asyncio.TimeoutError:
+            logger.warning(f"OwnerAgent {self._id} completion evaluation timed out")
+            # Return evaluation that continues execution - don't assume completion!
+            # This is critical for iterative execution to work properly
+            return CompletionEvaluation(
+                is_completed=False,
+                completion_percentage=50,
+                what_was_done="部分子任务已执行，但评估超时",
+                what_is_missing="无法确认任务是否完全完成",
+                next_steps=[
+                    {
+                        "description": "继续执行任务，确保所有要求都已满足",
+                        "tools_needed": ["execute_command"],
+                        "reason": "评估超时，需要继续推进以确保任务完成"
+                    }
+                ],
+            )
+        except Exception as e:
+            logger.exception(f"Error evaluating completion: {e}")
+            # Return evaluation that continues execution - don't assume completion!
+            return CompletionEvaluation(
+                is_completed=False,
+                completion_percentage=50,
+                what_was_done=f"部分子任务已执行，但评估出错: {str(e)}",
+                what_is_missing="无法确认任务是否完全完成",
+                next_steps=[
+                    {
+                        "description": "继续执行任务，确保所有要求都已满足",
+                        "tools_needed": ["execute_command"],
+                        "reason": "评估出错，需要继续推进以确保任务完成"
+                    }
+                ],
+            )
+
+    def _parse_completion_response(self, content: str) -> CompletionEvaluation:
+        """Parse completion evaluation response from LLM.
+
+        Args:
+            content: LLM response content.
+
+        Returns:
+            CompletionEvaluation object.
+        """
+        # Try to find JSON in the response
+        json_match = None
+        if "```json" in content:
+            start = content.find("```json") + 7
+            end = content.find("```", start)
+            if end > start:
+                json_match = content[start:end].strip()
+        elif "```" in content:
+            start = content.find("```") + 3
+            end = content.find("```", start)
+            if end > start:
+                json_match = content[start:end].strip()
+        elif "{" in content and "is_completed" in content:
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if end > start:
+                json_match = content[start:end]
+
+        if json_match:
+            try:
+                data = json.loads(json_match)
+                return CompletionEvaluation(
+                    is_completed=data.get("is_completed", True),
+                    completion_percentage=data.get("completion_percentage", 100),
+                    what_was_done=data.get("what_was_done", ""),
+                    what_is_missing=data.get("what_is_missing", ""),
+                    next_steps=data.get("next_steps", []),
+                )
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse completion JSON: {e}")
+
+        # Fallback: try to detect if task is actually completed based on content
+        # If the LLM response contains actual results (not evaluation JSON),
+        # the task may already be complete
+        content_lower = content.lower()
+        completion_indicators = ["完成", "总结", "结果", "汇总", "列表", "如下", "共", "总计"]
+        has_results = any(indicator in content for indicator in completion_indicators)
+
+        # Also check if we have successful results in previous iterations
+        successful_results = [r for r in results if r.success]
+
+        if has_results or successful_results:
+            # Task seems to have useful results, don't create more iterations
+            logger.info(f"Completion evaluation fallback: found {len(successful_results)} successful results, synthesizing")
+            return CompletionEvaluation(
+                is_completed=True,  # Force completion to synthesize results
+                completion_percentage=80,
+                what_was_done=f"已完成 {len(successful_results)} 个有效子任务",
+                what_is_missing="",
+                next_steps=[],
+            )
+
+        # Only create continuation if we really have no results at all
+        logger.warning("Failed to parse completion evaluation and no successful results, assuming NOT completed")
+        return CompletionEvaluation(
+            is_completed=False,
+            completion_percentage=50,
+            what_was_done="无法解析评估结果",
+            what_is_missing="需要继续执行以确保任务完成",
+            next_steps=[
+                {
+                    "description": "继续执行任务，根据原始用户请求检查是否还有未完成的工作",
+                    "tools_needed": ["execute_command"],
+                    "reason": "评估解析失败，需要继续推进"
+                }
+            ],
+        )
+
+    def _build_evaluation_context(
+        self,
+        current_request: str,
+        worker_messages: list[str],
+        is_worker_question: bool = False,
+    ) -> str:
+        """Build a context string for LLM evaluation or worker response.
+
+        This provides the full task context including conversation history
+        so the LLM can make informed decisions in multi-turn scenarios.
+
+        Args:
+            current_request: The current user request or worker question.
+            worker_messages: List of prior messages in the conversation.
+            is_worker_question: True if this is a worker question context.
+
+        Returns:
+            Formatted context string for LLM.
+        """
+        context_parts = []
+
+        if self._task_context:
+            context_parts.append(f"【任务背景】\n{self._task_context}")
+
+        if is_worker_question:
+            context_parts.append(f"【Worker的问题】\n{current_request}")
+        else:
+            context_parts.append(f"【原始用户请求】\n{current_request}")
+
+        if worker_messages:
+            context_parts.append(f"【对话历史】\n" + "\n".join(worker_messages[-10:]))
+
+        return "\n\n".join(context_parts)
 
     async def _synthesize_results(
         self,

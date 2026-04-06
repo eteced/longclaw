@@ -322,6 +322,58 @@ class MessageService:
         await pubsub.subscribe(REDIS_CHANNEL_TASK_UPDATES)
         return pubsub
 
+    async def get_recent_channel_messages(
+        self,
+        session: AsyncSession,
+        channel_id: str,
+        limit: int = 20,
+        exclude_types: list[MessageType] | None = None,
+        after_time: datetime | None = None,
+    ) -> list[Message]:
+        """Get recent messages from a channel for context building.
+
+        Returns messages where sender is CHANNEL (user) or receiver is CHANNEL (resident reply),
+        ordered from oldest to newest (chronological).
+
+        Args:
+            session: Database session.
+            channel_id: Channel ID to get messages from.
+            limit: Maximum number of messages to return.
+            exclude_types: Message types to exclude (e.g., TASK, ERROR).
+            after_time: Only return messages created after this time (for context reset).
+
+        Returns:
+            List of recent messages in chronological order.
+        """
+        from datetime import datetime as dt
+        from sqlalchemy import or_
+
+        # Query for channel-user messages and resident-channel messages (chat pairs)
+        query = (
+            select(Message)
+            .where(
+                or_(
+                    (Message.sender_type == SenderType.CHANNEL) & (Message.sender_id == channel_id),
+                    (Message.receiver_type == ReceiverType.CHANNEL) & (Message.receiver_id == channel_id),
+                )
+            )
+            .order_by(Message.created_at.desc())
+            .limit(limit)
+        )
+
+        if exclude_types:
+            query = query.where(Message.message_type.not_in(exclude_types))
+
+        if after_time:
+            query = query.where(Message.created_at > after_time)
+
+        result = await session.execute(query)
+        messages = list(result.scalars().all())
+
+        # Reverse to get chronological order (oldest first)
+        messages.reverse()
+        return messages
+
 
 # Global message service instance
 message_service = MessageService()
