@@ -142,8 +142,8 @@ curl -X GET http://localhost:8001/api/system-config \
 当前 LLM API Key 配置在 `backend/.env` 中:
 
 ```env
-OPENAI_API_KEY=sk-cp-rhwjmvovj6uodzed
-OPENAI_BASE_URL=https://cloud.infini-ai.com/maas/coding/v1
+OPENAI_API_KEY=YourOpenAIKey
+OPENAI_BASE_URL=YourOpenAIProvider
 ```
 
 如需修改 LLM 配置，请编辑 `backend/.env` 并重启服务。
@@ -230,8 +230,8 @@ API_KEY=YOUR_API_KEY
 
 # LLM 模型配置 ⚠️ 请使用你自己的 API Key
 LLM_DEFAULT_PROVIDER=openai
-OPENAI_API_KEY=sk-cp-rhwjmvovj6uodzed
-OPENAI_BASE_URL=https://cloud.infini-ai.com/maas/coding/v1
+OPENAI_API_KEY=YourOpenAIKey
+OPENAI_BASE_URL=YourOpenAIProvider
 OPENAI_MODEL=minimax-m2.7
 ```
 
